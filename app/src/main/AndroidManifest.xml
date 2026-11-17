@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.yuanyang.camera" android:versionCode="6" android:versionName="0.5.0">
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <application android:label="原样" android:icon="@drawable/ic_app"
+        android:theme="@style/AppTheme" android:allowBackup="false" android:supportsRtl="true">
+        <activity android:name=".CaptureActivity" android:screenOrientation="portrait" android:exported="false" />
+        <activity android:name=".ExportPreviewActivity" android:exported="false" />
+        <activity android:name=".MainActivity" android:launchMode="singleTop" android:screenOrientation="portrait" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <provider android:name=".ShareProvider" android:authorities="com.yuanyang.camera.share"
+            android:exported="false" android:grantUriPermissions="true" />
+    </application>
+</manifest>

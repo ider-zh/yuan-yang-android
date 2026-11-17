@@ -1,0 +1,763 @@
+package com.yuanyang.camera;
+
+import android.Manifest;
+import android.app.Activity;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.hardware.Camera;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.SystemClock;
+import android.provider.Settings;
+import android.view.Gravity;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
+import android.widget.SeekBar;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/** Captures upright JPEGs with an optional same-aspect reference overlay. */
+@SuppressWarnings("deprecation")
+public final class CaptureActivity extends Activity implements SurfaceHolder.Callback {
+    public static final String EXTRA_PATH = "path";
+    public static final String EXTRA_REFERENCE = "reference";
+    public static final String EXTRA_PROJECT = "project";
+    public static final String RESULT_OPEN_ALBUM_LIST = "open_album_list";
+    public static final String RESULT_OPEN_PROJECT = "open_project";
+    private static final int REQUEST_CAMERA = 72;
+    private static final int NO_CAMERA = -1;
+    private static final String CAMERA_FACING_KEY = "cameraFacing";
+    private static final int WHITE = Color.rgb(246, 244, 238);
+    private static final int MUTED = Color.rgb(181, 185, 173);
+    private static final int ACCENT = Color.rgb(206, 235, 137);
+    private static final int INK = Color.rgb(20, 24, 22);
+
+    private final ExecutorService writer = Executors.newSingleThreadExecutor();
+    private Camera camera;
+    private SurfaceView surface;
+    private AspectFrame finder;
+    private FinderOverlay overlay;
+    private Button shutter, switchCamera;
+    private Button overlayToggle;
+    private LinearLayout overlayControls;
+    private SeekBar overlaySlider;
+    private TextView hint, overlayAmount;
+    private Button albumListButton, currentAlbumButton;
+    private File target, referenceFile, pendingPhoto;
+    private Bitmap oldPhoto;
+    private Bitmap savedReference;
+    private SharedPreferences captureUi;
+    private int overlayStrength = 45;
+    private int captureSequence;
+    private int backCameraId = NO_CAMERA, frontCameraId = NO_CAMERA, fallbackCameraId = NO_CAMERA;
+    private int activeCameraId = NO_CAMERA;
+    private int preferredFacing = Camera.CameraInfo.CAMERA_FACING_BACK;
+    private boolean frontFacing;
+    private long lastSwitchAt = -400;
+    private boolean overlayVisible = true, invalidReference;
+    private String queuedNavigation;
+    private boolean resumed, previewing, shooting, saving, saveFinished, saveSucceeded, permissionPending;
+    private String saveErrorSummary;
+
+    @Override public void onCreate(Bundle state) {
+        super.onCreate(state);
+        setResult(RESULT_CANCELED);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        getWindow().setStatusBarColor(INK);
+        getWindow().setNavigationBarColor(INK);
+        View decor = getWindow().getDecorView();
+        decor.setSystemUiVisibility(decor.getSystemUiVisibility()
+                & ~(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR));
+        captureUi = getSharedPreferences("captureUi", MODE_PRIVATE);
+        preferredFacing = captureUi.getInt(CAMERA_FACING_KEY, Camera.CameraInfo.CAMERA_FACING_BACK);
+        overlayStrength = captureUi.getInt("overlayStrength", 45);
+        overlayVisible = captureUi.getBoolean("overlayVisible", true);
+        if (state != null) {
+            overlayStrength = state.getInt("overlayStrength", overlayStrength);
+            overlayVisible = state.getBoolean("overlayVisible", overlayVisible);
+        }
+        overlayStrength = Math.min(100, Math.max(1, overlayStrength));
+        String label = getIntent().getStringExtra(EXTRA_PROJECT);
+        String path = state != null ? state.getString("nextPath", getIntent().getStringExtra(EXTRA_PATH))
+                : getIntent().getStringExtra(EXTRA_PATH);
+        String prior = state != null ? state.getString("referencePath", getIntent().getStringExtra(EXTRA_REFERENCE))
+                : getIntent().getStringExtra(EXTRA_REFERENCE);
+        if (path != null && !path.isEmpty()) target = privateFile(path);
+        if (target != null && target.isFile()) {
+            prior = target.getPath(); // Process restored after a prior shot committed.
+            target = nextPhoto(target);
+        }
+        if (state != null) {
+            String pendingPath = state.getString("pendingPath");
+            File candidate = pendingPath == null ? null : privateFile(pendingPath);
+            if (candidate != null && candidate.isFile()) prior = candidate.getPath();
+        }
+        boolean requestedReference = prior != null && !prior.isEmpty();
+        if (requestedReference) {
+            referenceFile = privateFile(prior);
+            if (referenceFile != null) oldPhoto = PhotoTools.load(referenceFile, 1440);
+        }
+        invalidReference = requestedReference && oldPhoto == null;
+        buildUi(label == null || label.trim().isEmpty() ? "当前相册" : label);
+        if (target == null) {
+            hint.setText("没有可用的照片保存位置。请返回后重试。");
+            return;
+        }
+        if (!hasCameraPermission() && state == null) requestCameraPermission();
+        else if (!hasCameraPermission()) showPermissionAction();
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        state.putInt("overlayStrength", overlayStrength);
+        state.putBoolean("overlayVisible", overlayVisible);
+        if (target != null) state.putString("nextPath", target.getPath());
+        if (referenceFile != null) state.putString("referencePath", referenceFile.getPath());
+        if (pendingPhoto != null) state.putString("pendingPath", pendingPhoto.getPath());
+    }
+
+    private File privateFile(String path) {
+        try {
+            File f = new File(path).getCanonicalFile();
+            String p = f.getPath();
+            String appFiles = getFilesDir().getCanonicalPath() + File.separator;
+            String appCache = getCacheDir().getCanonicalPath() + File.separator;
+            return p.startsWith(appFiles) || p.startsWith(appCache) ? f : null;
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private void buildUi(String label) {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(INK);
+        root.setPadding(dp(16), dp(8), dp(16), dp(10));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        albumListButton = action("所有相册");
+        albumListButton.setOnClickListener(v -> leave(RESULT_OPEN_ALBUM_LIST));
+        header.addView(albumListButton, new LinearLayout.LayoutParams(dp(96), dp(48)));
+        View spacer = new View(this);
+        header.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
+        currentAlbumButton = action(label);
+        currentAlbumButton.setSingleLine(true);
+        currentAlbumButton.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        currentAlbumButton.setMinWidth(dp(92));
+        currentAlbumButton.setMaxWidth(dp(164));
+        currentAlbumButton.setSelected(true);
+        currentAlbumButton.setContentDescription("打开当前相册：" + label);
+        currentAlbumButton.setOnClickListener(v -> leave(RESULT_OPEN_PROJECT));
+        LinearLayout.LayoutParams currentAlbumParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48));
+        currentAlbumParams.leftMargin = dp(10);
+        header.addView(currentAlbumButton, currentAlbumParams);
+        root.addView(header);
+
+        FrameLayout stage = new FrameLayout(this);
+        stage.setBackgroundColor(Color.BLACK);
+        LinearLayout.LayoutParams stageParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        stageParams.topMargin = dp(12);
+        stageParams.bottomMargin = dp(11);
+        root.addView(stage, stageParams);
+        finder = new AspectFrame();
+        stage.addView(finder, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+        surface = new SurfaceView(this);
+        finder.addView(surface, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        surface.getHolder().addCallback(this);
+        overlay = new FinderOverlay();
+        finder.addView(overlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        hint = text(cameraHint(), 14, MUTED);
+        hint.setGravity(Gravity.CENTER);
+        hint.setMinHeight(dp(30));
+        hint.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        root.addView(hint);
+
+        overlayControls = new LinearLayout(this);
+        overlayControls.setGravity(Gravity.CENTER_VERTICAL);
+        overlayToggle = action("隐藏叠影");
+        overlayToggle.setOnClickListener(v -> {
+            overlayVisible = !overlayVisible;
+            refreshOverlayControls();
+            rememberOverlay();
+            if (previewing) hint.setText(cameraHint());
+        });
+        overlayControls.addView(overlayToggle, new LinearLayout.LayoutParams(dp(102), dp(48)));
+        overlaySlider = new SeekBar(this);
+        overlaySlider.setContentDescription("旧照片叠影透明度");
+        overlaySlider.setMax(99);
+        overlaySlider.setProgress(overlayStrength - 1);
+        overlaySlider.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        overlaySlider.setThumbTintList(ColorStateList.valueOf(ACCENT));
+        overlayControls.addView(overlaySlider, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        overlayAmount = text("", 13, WHITE);
+        overlayAmount.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        overlayControls.addView(overlayAmount, new LinearLayout.LayoutParams(dp(44), dp(48)));
+        overlaySlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
+                    overlayStrength = value + 1;
+                    refreshOverlayControls();
+                    if (fromUser) rememberOverlay();
+                }
+                @Override public void onStartTrackingTouch(SeekBar s) {}
+                @Override public void onStopTrackingTouch(SeekBar s) {}
+        });
+        root.addView(overlayControls);
+        refreshOverlayControls();
+
+        shutter = action(shutterLabel());
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(new ColorStateList(new int[][]{{-android.R.attr.state_enabled}, {}},
+                new int[]{Color.rgb(121, 143, 83), ACCENT}));
+        bg.setCornerRadius(dp(26));
+        shutter.setBackground(new RippleDrawable(ColorStateList.valueOf(0x22000000), bg, null));
+        shutter.setTextColor(INK);
+        shutter.setTextSize(16);
+        shutter.setTypeface(null, android.graphics.Typeface.BOLD);
+        shutter.setOnClickListener(v -> {
+            if (!hasCameraPermission()) {
+                if (shouldOpenPermissionSettings()) {
+                    Intent settings = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", getPackageName(), null));
+                    try { startActivity(settings); }
+                    catch (RuntimeException e) { hint.setText("请从手机设置打开原样的相机权限。"); }
+                } else requestCameraPermission();
+            }
+            else if (!previewing) startCameraIfReady();
+            else if (!shooting) takePhoto();
+        });
+        LinearLayout actions = new LinearLayout(this);
+        actions.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        actionsParams.topMargin = dp(5);
+        root.addView(actions, actionsParams);
+        actions.addView(shutter, new LinearLayout.LayoutParams(dp(150), dp(48)));
+        switchCamera = action("切换到前置");
+        switchCamera.setOnClickListener(v -> switchFacing());
+        LinearLayout.LayoutParams switchParams = new LinearLayout.LayoutParams(dp(108), dp(48));
+        switchParams.leftMargin = dp(10);
+        actions.addView(switchCamera, switchParams);
+        updateSwitchControl();
+        shutter.setEnabled(false);
+        setContentView(root);
+    }
+
+    private void refreshOverlayControls() {
+        boolean hasReference = oldPhoto != null;
+        overlayControls.setVisibility(hasReference ? View.VISIBLE : View.GONE);
+        overlayToggle.setText(overlayVisible ? "隐藏叠影" : "显示叠影");
+        overlayToggle.setSelected(overlayVisible);
+        overlaySlider.setEnabled(overlayVisible);
+        overlayAmount.setText(overlayStrength + "%");
+        overlayAmount.setTextColor(overlayVisible ? WHITE : MUTED);
+        overlay.opacity = overlayVisible ? overlayStrength / 100f : 0f;
+        overlay.invalidate();
+    }
+
+    private void rememberOverlay() {
+        captureUi.edit().putBoolean("overlayVisible", overlayVisible)
+                .putInt("overlayStrength", overlayStrength).apply();
+    }
+
+    private boolean hasCameraPermission() {
+        return Build.VERSION.SDK_INT < 23
+                || checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestCameraPermission() {
+        if (Build.VERSION.SDK_INT >= 23 && !permissionPending) {
+            permissionPending = true;
+            captureUi.edit().putBoolean("cameraPermissionRequested", true).apply();
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA);
+        }
+    }
+
+    @Override public void onRequestPermissionsResult(int code, String[] permissions, int[] granted) {
+        super.onRequestPermissionsResult(code, permissions, granted);
+        if (code != REQUEST_CAMERA) return;
+        permissionPending = false;
+        if (hasCameraPermission()) startCameraIfReady();
+        else showPermissionAction();
+    }
+
+    private void showPermissionAction() {
+        boolean settings = shouldOpenPermissionSettings();
+        hint.setText(settings ? "请在系统设置里开启相机权限，再返回拍摄。" : "拍照需要相机权限，照片只保存在本机。");
+        shutter.setText(settings ? "打开权限设置" : "申请相机权限");
+        shutter.setEnabled(true);
+    }
+
+    private boolean shouldOpenPermissionSettings() {
+        return Build.VERSION.SDK_INT >= 23 && !permissionPending
+                && captureUi.getBoolean("cameraPermissionRequested", false)
+                && !shouldShowRequestPermissionRationale(Manifest.permission.CAMERA);
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        resumed = true;
+        if (saveFinished) deliverSave();
+        else if (target != null && !hasCameraPermission() && !permissionPending) showPermissionAction();
+        else startCameraIfReady();
+    }
+
+    @Override protected void onPause() {
+        resumed = false;
+        if (!saving) shooting = false;
+        closeCamera();
+        super.onPause();
+    }
+
+    @Override protected void onDestroy() {
+        closeCamera();
+        writer.shutdown();
+        super.onDestroy();
+    }
+
+    @Override public void surfaceCreated(SurfaceHolder holder) { startCameraIfReady(); }
+    @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) { startCameraIfReady(); }
+    @Override public void surfaceDestroyed(SurfaceHolder holder) {
+        if (!saving) shooting = false;
+        closeCamera();
+    }
+
+    private void startCameraIfReady() {
+        if (!resumed || isFinishing() || camera != null || shooting || target == null || !hasCameraPermission()
+                || !surface.getHolder().getSurface().isValid()) return;
+        findCameras();
+        int preferred = preferredFacing == Camera.CameraInfo.CAMERA_FACING_FRONT ? frontCameraId : backCameraId;
+        int alternate = preferredFacing == Camera.CameraInfo.CAMERA_FACING_FRONT ? backCameraId : frontCameraId;
+        if (openCamera(preferred) || openCamera(alternate)
+                || (fallbackCameraId != preferred && fallbackCameraId != alternate && openCamera(fallbackCameraId))) return;
+        showRetry("无法打开相机，检查是否被其他应用占用。");
+    }
+
+    private void findCameras() {
+        backCameraId = frontCameraId = fallbackCameraId = NO_CAMERA;
+        int count;
+        try { count = Camera.getNumberOfCameras(); }
+        catch (RuntimeException e) { return; }
+        for (int i = 0; i < count; i++) {
+            Camera.CameraInfo info = new Camera.CameraInfo();
+            try { Camera.getCameraInfo(i, info); }
+            catch (RuntimeException e) { continue; }
+            if (fallbackCameraId == NO_CAMERA) fallbackCameraId = i;
+            if (info.facing == Camera.CameraInfo.CAMERA_FACING_BACK && backCameraId == NO_CAMERA) backCameraId = i;
+            if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT && frontCameraId == NO_CAMERA) frontCameraId = i;
+        }
+    }
+
+    private boolean openCamera(int cameraId) {
+        if (cameraId == NO_CAMERA) return false;
+        try {
+            Camera.CameraInfo info = new Camera.CameraInfo();
+            Camera.getCameraInfo(cameraId, info);
+            boolean front = info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT;
+            camera = Camera.open(cameraId);
+            Camera cameraOpened = camera;
+            Camera.Parameters p = camera.getParameters();
+            Camera.Size photo = choosePhoto(p.getSupportedPictureSizes(), p.getPictureSize());
+            Camera.Size preview = choosePreview(p.getSupportedPreviewSizes(), p.getPreviewSize(), photo);
+            p.setPictureSize(photo.width, photo.height);
+            p.setPreviewSize(preview.width, preview.height);
+            p.setJpegQuality(92);
+            int jpegRotation = (info.orientation + (front ? displayDegrees() : -displayDegrees()) + 360) % 360;
+            // Camera1 mirrors front preview before rotation. Keep the original
+            // JPEG unmirrored and mirror only the reference drawn over preview.
+            int previewRotation = front ? (360 - jpegRotation) % 360 : jpegRotation;
+            p.setRotation(jpegRotation);
+            List<String> focus = p.getSupportedFocusModes();
+            if (focus != null && focus.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+                p.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+            } else if (focus != null && focus.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                p.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+            }
+            camera.setParameters(p);
+            camera.setDisplayOrientation(previewRotation);
+            finder.ratio = previewRotation % 180 == 0 ? (float) preview.width / preview.height : (float) preview.height / preview.width;
+            finder.requestLayout();
+            camera.setPreviewDisplay(surface.getHolder());
+            camera.setErrorCallback((error, instance) -> {
+                if (camera != cameraOpened) return;
+                closeCamera();
+                if (!saving) {
+                    shooting = false;
+                    showRetry("相机中断，请重试。");
+                }
+            });
+            activeCameraId = cameraId;
+            frontFacing = front;
+            startPreview();
+            if (preferredFacing != info.facing || !captureUi.contains(CAMERA_FACING_KEY)) {
+                preferredFacing = info.facing;
+                captureUi.edit().putInt(CAMERA_FACING_KEY, preferredFacing).apply();
+            }
+            overlay.invalidate();
+            return true;
+        } catch (IOException | RuntimeException e) {
+            closeCamera();
+            return false;
+        }
+    }
+
+    private void switchFacing() {
+        long now = SystemClock.elapsedRealtime();
+        if (!resumed || isFinishing() || !previewing || shooting || saving || queuedNavigation != null
+                || now - lastSwitchAt < 350 || backCameraId == NO_CAMERA || frontCameraId == NO_CAMERA) return;
+        int before = activeCameraId;
+        int requested = frontFacing ? backCameraId : frontCameraId;
+        if (requested == before) return;
+        shutter.setEnabled(false);
+        closeCamera();
+        if (!openCamera(requested)) {
+            if (openCamera(before)) hint.setText("切换失败，已恢复原摄像头。");
+            else showRetry("切换失败，请重试相机。");
+        }
+        lastSwitchAt = SystemClock.elapsedRealtime();
+    }
+
+    private void updateSwitchControl() {
+        if (switchCamera == null) return;
+        boolean both = backCameraId != NO_CAMERA && frontCameraId != NO_CAMERA;
+        switchCamera.setVisibility(both ? View.VISIBLE : View.GONE);
+        switchCamera.setEnabled(both && previewing && !shooting && !saving && resumed);
+        String action = frontFacing ? "切换到后置" : "切换到前置";
+        switchCamera.setText(action);
+        switchCamera.setContentDescription(action + "摄像头");
+    }
+
+    private void startPreview() {
+        camera.startPreview();
+        previewing = true;
+        shutter.setText(shutterLabel());
+        shutter.setEnabled(true);
+        hint.setText(cameraHint());
+        updateSwitchControl();
+    }
+
+    private int displayDegrees() {
+        switch (getWindowManager().getDefaultDisplay().getRotation()) {
+            case Surface.ROTATION_90: return 90;
+            case Surface.ROTATION_180: return 180;
+            case Surface.ROTATION_270: return 270;
+            default: return 0;
+        }
+    }
+
+    private static Camera.Size choosePhoto(List<Camera.Size> all, Camera.Size fallback) {
+        if (all == null || all.isEmpty()) return fallback;
+        Camera.Size best = fallback;
+        double bestScore = Double.POSITIVE_INFINITY;
+        for (Camera.Size s : all) {
+            double ratio = (double) s.width / s.height;
+            double area = (double) s.width * s.height;
+            // Prefer a native four-to-three full frame, bounded around four megapixels.
+            double score = Math.abs(ratio - 4d / 3d) * 30 + Math.abs(Math.log(area / 4000000d));
+            if (area < 1000000) score += 3;
+            if (score < bestScore) { best = s; bestScore = score; }
+        }
+        return best;
+    }
+
+    private static Camera.Size choosePreview(List<Camera.Size> all, Camera.Size fallback, Camera.Size photo) {
+        if (all == null || all.isEmpty()) return fallback;
+        double photoRatio = (double) photo.width / photo.height;
+        Camera.Size best = fallback;
+        double bestScore = Double.POSITIVE_INFINITY;
+        for (Camera.Size s : all) {
+            double ratio = (double) s.width / s.height;
+            double area = (double) s.width * s.height;
+            double score = Math.abs(ratio - photoRatio) * 80 + Math.abs(Math.log(area / 1000000d));
+            if (score < bestScore) { best = s; bestScore = score; }
+        }
+        return best;
+    }
+
+    private void takePhoto() {
+        Camera current = camera;
+        if (current == null || !previewing || shooting) return;
+        int shot = ++captureSequence;
+        shooting = true;
+        shutter.setEnabled(false);
+        updateSwitchControl();
+        hint.setText("正在拍摄…");
+        String focusMode;
+        try {
+            focusMode = current.getParameters().getFocusMode();
+        } catch (RuntimeException e) {
+            triggerShutter(current, shot);
+            return;
+        }
+        if (Camera.Parameters.FOCUS_MODE_AUTO.equals(focusMode)) {
+            try {
+                current.autoFocus((success, instance) -> triggerShutter(instance, shot));
+                shutter.postDelayed(() -> triggerShutter(current, shot), 850);
+            } catch (RuntimeException e) {
+                triggerShutter(current, shot);
+            }
+        } else {
+            triggerShutter(current, shot);
+        }
+    }
+
+    private void triggerShutter(Camera current, int shot) {
+        if (camera != current || shot != captureSequence || !previewing || !shooting) return;
+        previewing = false; // Also prevents the autofocus timeout from taking a second photo.
+        try {
+            current.takePicture(null, null, (data, instance) -> {
+                if (camera != instance || shot != captureSequence || !shooting || isFinishing()) return;
+                if (data == null || data.length < 4 || (data[0] & 255) != 0xff || (data[1] & 255) != 0xd8) {
+                    recoverAfterCapture("相机没有生成照片，请重新拍摄。");
+                    return;
+                }
+                saving = true;
+                File destination = target;
+                pendingPhoto = destination;
+                target = nextPhoto(destination);
+                hint.setText("正在保存…");
+                writer.execute(() -> {
+                    boolean ok = false;
+                    String error = "照片未能保存，请检查存储空间后重试。";
+                    Bitmap decoded = null;
+                    try {
+                        decoded = saveJpeg(data, destination);
+                        ok = true;
+                    } catch (InvalidPhotoException ignored) {
+                        error = "照片无法读取，请重新拍摄。";
+                    } catch (IOException | RuntimeException ignored) {}
+                    final boolean success = ok;
+                    final Bitmap result = decoded;
+                    final String reason = error;
+                    runOnUiThread(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        saveFinished = true;
+                        saveSucceeded = success;
+                        savedReference = result;
+                        saveErrorSummary = reason;
+                        if (resumed) deliverSave();
+                    });
+                });
+            });
+            shutter.postDelayed(() -> {
+                if (camera == current && shot == captureSequence && shooting && !saving)
+                    recoverAfterCapture("相机响应超时，请重新拍摄。");
+            }, 8000);
+        } catch (RuntimeException e) {
+            recoverAfterCapture("拍摄失败，请重试。");
+        }
+    }
+
+    private static File nextPhoto(File previous) {
+        return new File(previous.getParentFile(), UUID.randomUUID() + ".jpg");
+    }
+
+    private static final class InvalidPhotoException extends IOException {}
+
+    private Bitmap saveJpeg(byte[] data, File destination) throws IOException {
+        File folder = destination.getParentFile();
+        if (folder == null || (!folder.isDirectory() && !folder.mkdirs() && !folder.isDirectory()))
+            throw new IOException("Cannot create photo directory");
+        File temp = File.createTempFile("capture-", ".pending", folder);
+        try {
+            try (FileOutputStream stream = new FileOutputStream(temp)) {
+                stream.write(data);
+                stream.getFD().sync();
+            }
+            Bitmap decoded = PhotoTools.load(temp, 1440);
+            if (decoded == null) throw new InvalidPhotoException();
+            if (destination.exists()) throw new IOException("Timeline photos are immutable");
+            if (!temp.renameTo(destination)) throw new IOException("Cannot publish photo");
+            return decoded;
+        } finally {
+            if (temp.exists()) temp.delete();
+        }
+    }
+
+    private void deliverSave() {
+        saving = false;
+        saveFinished = false;
+        if (queuedNavigation != null) {
+            if (!saveSucceeded) Toast.makeText(this, saveErrorSummary, Toast.LENGTH_SHORT).show();
+            finishNavigation(queuedNavigation);
+            return;
+        }
+        if (saveSucceeded) {
+            shooting = false;
+            referenceFile = pendingPhoto;
+            pendingPhoto = null;
+            oldPhoto = savedReference;
+            savedReference = null;
+            invalidReference = false;
+            refreshOverlayControls();
+            if (camera != null && surface.getHolder().getSurface().isValid()) {
+                try { startPreview(); }
+                catch (RuntimeException e) { closeCamera(); }
+            } else closeCamera();
+            if (!previewing) startCameraIfReady();
+            if (previewing) hint.setText("已保存。 " + cameraHint());
+        } else {
+            pendingPhoto = null;
+            recoverAfterCapture(saveErrorSummary);
+        }
+    }
+
+    private void recoverAfterCapture(String reason) {
+        closeCamera();
+        shooting = false;
+        startCameraIfReady();
+        hint.setText(reason);
+        if (!previewing) showRetry(reason);
+    }
+
+    private void showRetry(String reason) {
+        hint.setText(reason);
+        shutter.setText("重试相机");
+        shutter.setEnabled(true);
+    }
+
+    private void closeCamera() {
+        previewing = false;
+        activeCameraId = NO_CAMERA;
+        updateSwitchControl();
+        Camera previous = camera;
+        camera = null;
+        if (previous == null) return;
+        try { previous.setErrorCallback(null); } catch (RuntimeException ignored) {}
+        try { previous.stopPreview(); } catch (RuntimeException ignored) {}
+        try { previous.release(); } catch (RuntimeException ignored) {}
+    }
+
+    @Override public void onBackPressed() { leave(RESULT_OPEN_PROJECT); }
+
+    private void leave(String destination) {
+        if (isFinishing() || queuedNavigation != null) return;
+        if (saving) {
+            queuedNavigation = destination;
+            albumListButton.setEnabled(false);
+            currentAlbumButton.setEnabled(false);
+            hint.setText("正在保存，完成后打开相册…");
+            return;
+        }
+        finishNavigation(destination);
+    }
+
+    private void finishNavigation(String destination) {
+        shooting = false;
+        closeCamera();
+        setResult(RESULT_OK, new Intent().putExtra(destination, true));
+        finish();
+    }
+
+    private String shutterLabel() {
+        return oldPhoto != null ? "复拍" : "拍照";
+    }
+
+    private String cameraHint() {
+        String status;
+        if (oldPhoto != null) status = overlayVisible ? "移动手机，手动对齐旧照。" : "叠影已隐藏，拍照仍会保存到相册。";
+        else if (invalidReference) status = "上一张照片无法读取，可继续拍摄。";
+        else status = "照片保存在当前相册中。";
+        return frontFacing ? "前置预览为镜像，保存不镜像。\n" + status : status;
+    }
+
+    private int dp(float n) { return Math.round(getResources().getDisplayMetrics().density * n); }
+
+    private TextView text(String value, int size, int color) {
+        TextView view = new TextView(this);
+        view.setText(value);
+        view.setTextSize(size);
+        view.setTextColor(color);
+        return view;
+    }
+
+    private Button action(String value) {
+        Button button = new Button(this);
+        button.setText(value);
+        button.setAllCaps(false);
+        button.setTextColor(WHITE);
+        button.setTextSize(14);
+        button.setMinimumWidth(0);
+        button.setPadding(dp(9), 0, dp(9), 0);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(new ColorStateList(new int[][]{{android.R.attr.state_selected}, {}},
+                new int[]{Color.rgb(59, 76, 48), Color.rgb(42, 55, 47)}));
+        bg.setCornerRadius(dp(13));
+        button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), bg, null));
+        return button;
+    }
+
+    private final class AspectFrame extends FrameLayout {
+        float ratio = 3f / 4f;
+        AspectFrame() { super(CaptureActivity.this); }
+        @Override protected void onMeasure(int width, int height) {
+            int w = MeasureSpec.getSize(width), h = MeasureSpec.getSize(height);
+            if (w > 0 && h > 0) {
+                if ((float) w / h > ratio) w = (int) (h * ratio);
+                else h = (int) (w / ratio);
+            }
+            super.onMeasure(MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
+                    MeasureSpec.makeMeasureSpec(h, MeasureSpec.EXACTLY));
+        }
+    }
+
+    private final class FinderOverlay extends View {
+        private final Paint imagePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final Paint guides = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF bounds = new RectF();
+        private float opacity = 0.45f;
+        FinderOverlay() { super(CaptureActivity.this); }
+        @Override protected void onDraw(Canvas c) {
+            float w = getWidth(), h = getHeight();
+            if (oldPhoto != null && opacity > 0) {
+                imagePaint.setAlpha(Math.round(opacity * 255));
+                bounds.set(0f, 0f, w, h);
+                int save = c.save();
+                if (frontFacing) c.scale(-1f, 1f, w / 2f, h / 2f);
+                PhotoTools.drawCover(c, oldPhoto, bounds, imagePaint);
+                c.restoreToCount(save);
+            }
+            guides.setColor(0x60FFFFFF);
+            guides.setStrokeWidth(dp(1));
+            for (int i = 1; i < 3; i++) {
+                c.drawLine(w * i / 3, 0, w * i / 3, h, guides);
+                c.drawLine(0, h * i / 3, w, h * i / 3, guides);
+            }
+            guides.setColor(0xB4FFFFFF);
+            float center = dp(7);
+            c.drawLine(w / 2 - center, h / 2, w / 2 + center, h / 2, guides);
+            c.drawLine(w / 2, h / 2 - center, w / 2, h / 2 + center, guides);
+        }
+    }
+}
