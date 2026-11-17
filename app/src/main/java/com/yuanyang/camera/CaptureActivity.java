@@ -10,6 +10,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -62,7 +63,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     private SurfaceView surface;
     private AspectFrame finder;
     private FinderOverlay overlay;
-    private Button shutter, switchCamera;
+    private Button shutter, switchCamera, overlaySettings, recoveryAction;
     private Button overlayToggle;
     private LinearLayout overlayControls;
     private SeekBar overlaySlider;
@@ -79,7 +80,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     private int preferredFacing = Camera.CameraInfo.CAMERA_FACING_BACK;
     private boolean frontFacing;
     private long lastSwitchAt = -400;
-    private boolean overlayVisible = true, invalidReference;
+    private boolean overlayVisible = true, overlayPanelExpanded, invalidReference;
     private String queuedNavigation;
     private boolean resumed, previewing, shooting, saving, saveFinished, saveSucceeded, permissionPending;
     private String saveErrorSummary;
@@ -100,6 +101,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         if (state != null) {
             overlayStrength = state.getInt("overlayStrength", overlayStrength);
             overlayVisible = state.getBoolean("overlayVisible", overlayVisible);
+            overlayPanelExpanded = state.getBoolean("overlayPanelExpanded", false);
         }
         overlayStrength = Math.min(100, Math.max(1, overlayStrength));
         String label = getIntent().getStringExtra(EXTRA_PROJECT);
@@ -136,6 +138,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         super.onSaveInstanceState(state);
         state.putInt("overlayStrength", overlayStrength);
         state.putBoolean("overlayVisible", overlayVisible);
+        state.putBoolean("overlayPanelExpanded", overlayPanelExpanded);
         if (target != null) state.putString("nextPath", target.getPath());
         if (referenceFile != null) state.putString("referencePath", referenceFile.getPath());
         if (pendingPhoto != null) state.putString("pendingPath", pendingPhoto.getPath());
@@ -162,8 +165,12 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         LinearLayout header = new LinearLayout(this);
         header.setGravity(Gravity.CENTER_VERTICAL);
         albumListButton = action("所有相册");
+        albumListButton.setSingleLine(true);
+        albumListButton.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        albumListButton.setMinWidth(dp(96));
+        albumListButton.setMaxWidth(dp(134));
         albumListButton.setOnClickListener(v -> leave(RESULT_OPEN_ALBUM_LIST));
-        header.addView(albumListButton, new LinearLayout.LayoutParams(dp(96), dp(48)));
+        header.addView(albumListButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         View spacer = new View(this);
         header.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
         currentAlbumButton = action(label);
@@ -204,6 +211,24 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         hint.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         root.addView(hint);
 
+        recoveryAction = action("");
+        recoveryAction.setMinHeight(dp(48));
+        recoveryAction.setOnClickListener(v -> {
+            if (!hasCameraPermission()) {
+                if (shouldOpenPermissionSettings()) {
+                    Intent settings = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", getPackageName(), null));
+                    try { startActivity(settings); }
+                    catch (RuntimeException e) { hint.setText("请从手机设置打开原样的相机权限。"); }
+                } else requestCameraPermission();
+            } else startCameraIfReady();
+        });
+        LinearLayout.LayoutParams recoveryParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        recoveryParams.gravity = Gravity.CENTER_HORIZONTAL;
+        root.addView(recoveryAction, recoveryParams);
+        recoveryAction.setVisibility(View.GONE);
+
         overlayControls = new LinearLayout(this);
         overlayControls.setGravity(Gravity.CENTER_VERTICAL);
         overlayToggle = action("隐藏叠影");
@@ -213,7 +238,8 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             rememberOverlay();
             if (previewing) hint.setText(cameraHint());
         });
-        overlayControls.addView(overlayToggle, new LinearLayout.LayoutParams(dp(102), dp(48)));
+        overlayToggle.setMinWidth(dp(94));
+        overlayControls.addView(overlayToggle, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         overlaySlider = new SeekBar(this);
         overlaySlider.setContentDescription("旧照片叠影透明度");
         overlaySlider.setMax(99);
@@ -223,7 +249,8 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         overlayControls.addView(overlaySlider, new LinearLayout.LayoutParams(0, dp(48), 1f));
         overlayAmount = text("", 13, WHITE);
         overlayAmount.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        overlayControls.addView(overlayAmount, new LinearLayout.LayoutParams(dp(44), dp(48)));
+        overlayAmount.setMinWidth(dp(42));
+        overlayControls.addView(overlayAmount, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         overlaySlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                 @Override public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
                     overlayStrength = value + 1;
@@ -234,41 +261,30 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
                 @Override public void onStopTrackingTouch(SeekBar s) {}
         });
         root.addView(overlayControls);
-        refreshOverlayControls();
 
-        shutter = action(shutterLabel());
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(new ColorStateList(new int[][]{{-android.R.attr.state_enabled}, {}},
-                new int[]{Color.rgb(121, 143, 83), ACCENT}));
-        bg.setCornerRadius(dp(26));
-        shutter.setBackground(new RippleDrawable(ColorStateList.valueOf(0x22000000), bg, null));
-        shutter.setTextColor(INK);
-        shutter.setTextSize(16);
-        shutter.setTypeface(null, android.graphics.Typeface.BOLD);
+        shutter = new GlyphButton(GlyphButton.SHUTTER);
+        shutter.setContentDescription(shutterLabel());
         shutter.setOnClickListener(v -> {
-            if (!hasCameraPermission()) {
-                if (shouldOpenPermissionSettings()) {
-                    Intent settings = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", getPackageName(), null));
-                    try { startActivity(settings); }
-                    catch (RuntimeException e) { hint.setText("请从手机设置打开原样的相机权限。"); }
-                } else requestCameraPermission();
-            }
-            else if (!previewing) startCameraIfReady();
-            else if (!shooting) takePhoto();
+            if (!shooting && previewing) takePhoto();
         });
-        LinearLayout actions = new LinearLayout(this);
-        actions.setGravity(Gravity.CENTER);
+        FrameLayout actions = new FrameLayout(this);
         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(76));
         actionsParams.topMargin = dp(5);
         root.addView(actions, actionsParams);
-        actions.addView(shutter, new LinearLayout.LayoutParams(dp(150), dp(48)));
-        switchCamera = action("切换到前置");
+        actions.addView(shutter, new FrameLayout.LayoutParams(dp(72), dp(72), Gravity.CENTER));
+
+        overlaySettings = new GlyphButton(GlyphButton.OVERLAY);
+        overlaySettings.setOnClickListener(v -> {
+            overlayPanelExpanded = !overlayPanelExpanded;
+            refreshOverlayControls();
+        });
+        actions.addView(overlaySettings, new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.LEFT | Gravity.CENTER_VERTICAL));
+
+        switchCamera = new GlyphButton(GlyphButton.FLIP);
         switchCamera.setOnClickListener(v -> switchFacing());
-        LinearLayout.LayoutParams switchParams = new LinearLayout.LayoutParams(dp(108), dp(48));
-        switchParams.leftMargin = dp(10);
-        actions.addView(switchCamera, switchParams);
+        actions.addView(switchCamera, new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.RIGHT | Gravity.CENTER_VERTICAL));
+        refreshOverlayControls();
         updateSwitchControl();
         shutter.setEnabled(false);
         setContentView(root);
@@ -276,7 +292,10 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
 
     private void refreshOverlayControls() {
         boolean hasReference = oldPhoto != null;
-        overlayControls.setVisibility(hasReference ? View.VISIBLE : View.GONE);
+        overlayControls.setVisibility(hasReference && overlayPanelExpanded ? View.VISIBLE : View.GONE);
+        overlaySettings.setVisibility(hasReference ? View.VISIBLE : View.INVISIBLE);
+        overlaySettings.setSelected(overlayPanelExpanded);
+        labelGlyph(overlaySettings, overlayPanelExpanded ? "收起叠影设置" : "叠影设置");
         overlayToggle.setText(overlayVisible ? "隐藏叠影" : "显示叠影");
         overlayToggle.setSelected(overlayVisible);
         overlaySlider.setEnabled(overlayVisible);
@@ -284,6 +303,11 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         overlayAmount.setTextColor(overlayVisible ? WHITE : MUTED);
         overlay.opacity = overlayVisible ? overlayStrength / 100f : 0f;
         overlay.invalidate();
+    }
+
+    private void labelGlyph(Button button, String label) {
+        button.setContentDescription(label);
+        if (Build.VERSION.SDK_INT >= 26) button.setTooltipText(label);
     }
 
     private void rememberOverlay() {
@@ -315,8 +339,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     private void showPermissionAction() {
         boolean settings = shouldOpenPermissionSettings();
         hint.setText(settings ? "请在系统设置里开启相机权限，再返回拍摄。" : "拍照需要相机权限，照片只保存在本机。");
-        shutter.setText(settings ? "打开权限设置" : "申请相机权限");
-        shutter.setEnabled(true);
+        showRecovery(settings ? "打开权限设置" : "申请相机权限");
     }
 
     private boolean shouldOpenPermissionSettings() {
@@ -454,14 +477,14 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         switchCamera.setVisibility(both ? View.VISIBLE : View.GONE);
         switchCamera.setEnabled(both && previewing && !shooting && !saving && resumed);
         String action = frontFacing ? "切换到后置" : "切换到前置";
-        switchCamera.setText(action);
-        switchCamera.setContentDescription(action + "摄像头");
+        labelGlyph(switchCamera, action + "摄像头");
     }
 
     private void startPreview() {
         camera.startPreview();
         previewing = true;
-        shutter.setText(shutterLabel());
+        recoveryAction.setVisibility(View.GONE);
+        labelGlyph(shutter, shutterLabel());
         shutter.setEnabled(true);
         hint.setText(cameraHint());
         updateSwitchControl();
@@ -643,8 +666,13 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
 
     private void showRetry(String reason) {
         hint.setText(reason);
-        shutter.setText("重试相机");
-        shutter.setEnabled(true);
+        showRecovery("重试相机");
+    }
+
+    private void showRecovery(String label) {
+        shutter.setEnabled(false);
+        recoveryAction.setText(label);
+        recoveryAction.setVisibility(View.VISIBLE);
     }
 
     private void closeCamera() {
@@ -716,6 +744,98 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         bg.setCornerRadius(dp(13));
         button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), bg, null));
         return button;
+    }
+
+    /** Local vectors keep the three fixed touch targets independent of font scale. */
+    private final class GlyphButton extends Button {
+        static final int SHUTTER = 0, OVERLAY = 1, FLIP = 2;
+        final int glyph;
+        final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        final Path path = new Path();
+
+        GlyphButton(int glyph) {
+            super(CaptureActivity.this);
+            this.glyph = glyph;
+            setPadding(0, 0, 0, 0);
+            setMinWidth(0);
+            setMinHeight(0);
+            setMinimumWidth(0);
+            setMinimumHeight(0);
+            setFocusable(true);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setShape(GradientDrawable.OVAL);
+            if (glyph == SHUTTER) bg.setColor(Color.TRANSPARENT);
+            else bg.setColor(new ColorStateList(new int[][]{{android.R.attr.state_selected}, {}},
+                    new int[]{Color.rgb(59, 76, 48), Color.rgb(42, 55, 47)}));
+            GradientDrawable mask = new GradientDrawable();
+            mask.setShape(GradientDrawable.OVAL);
+            mask.setColor(Color.WHITE);
+            setBackground(new RippleDrawable(ColorStateList.valueOf(0x38FFFFFF), bg, mask));
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            if (glyph == SHUTTER) {
+                float cx = getWidth() / 2f, cy = getHeight() / 2f;
+                paint.setColor(isEnabled() ? WHITE : MUTED);
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(dp(3));
+                canvas.drawCircle(cx, cy, dp(32), paint);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(isEnabled() ? ACCENT : Color.rgb(91, 103, 80));
+                canvas.drawCircle(cx, cy, dp(25), paint);
+                return;
+            }
+            int save = canvas.save();
+            float px = dp(26);
+            canvas.translate((getWidth() - px) / 2f, (getHeight() - px) / 2f);
+            canvas.scale(px / 24f, px / 24f);
+            paint.setColor(isEnabled() ? WHITE : MUTED);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(1.8f);
+            if (glyph == OVERLAY) {
+                canvas.drawRoundRect(6f, 7f, 21.5f, 20.5f, 2f, 2f, paint);
+                path.reset();
+                path.moveTo(2.5f, 16f);
+                path.lineTo(2.5f, 5.5f);
+                path.quadTo(2.5f, 3.5f, 4.5f, 3.5f);
+                path.lineTo(17f, 3.5f);
+                canvas.drawPath(path, paint);
+                path.reset();
+                path.moveTo(8.5f, 17.5f);
+                path.lineTo(12.5f, 13.5f);
+                path.lineTo(15f, 16f);
+                path.lineTo(17f, 14f);
+                path.lineTo(19f, 16f);
+                canvas.drawPath(path, paint);
+                paint.setStyle(Paint.Style.FILL);
+                canvas.drawCircle(17.6f, 10.8f, 1.15f, paint);
+            } else {
+                // Camera outline plus opposing arrows, in the familiar Material camera-switch form.
+                path.reset();
+                path.moveTo(2.5f, 8.5f);
+                path.quadTo(2.5f, 7f, 4f, 7f);
+                path.lineTo(7f, 7f);
+                path.lineTo(9f, 4.5f);
+                path.lineTo(15f, 4.5f);
+                path.lineTo(17f, 7f);
+                path.lineTo(20f, 7f);
+                path.quadTo(21.5f, 7f, 21.5f, 8.5f);
+                path.lineTo(21.5f, 18f);
+                path.quadTo(21.5f, 19.5f, 20f, 19.5f);
+                path.lineTo(4f, 19.5f);
+                path.quadTo(2.5f, 19.5f, 2.5f, 18f);
+                path.close();
+                canvas.drawPath(path, paint);
+                canvas.drawLine(8f, 11f, 16f, 11f, paint);
+                canvas.drawLine(16f, 11f, 14f, 9f, paint);
+                canvas.drawLine(16f, 15.5f, 8f, 15.5f, paint);
+                canvas.drawLine(8f, 15.5f, 10f, 17.5f, paint);
+            }
+            canvas.restoreToCount(save);
+        }
     }
 
     private final class AspectFrame extends FrameLayout {

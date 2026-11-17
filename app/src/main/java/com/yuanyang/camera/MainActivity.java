@@ -2,6 +2,7 @@ package com.yuanyang.camera;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Dialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
@@ -11,10 +12,20 @@ import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.LruCache;
+import android.view.MotionEvent;
 import android.text.InputFilter;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.widget.BaseAdapter;
+import android.widget.FrameLayout;
+import android.widget.ListView;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.EditText;
 import android.widget.CheckBox;
 import android.widget.ImageView;
@@ -26,6 +37,7 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.File;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Collections;
@@ -36,6 +48,9 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 public final class MainActivity extends Activity {
     private static final int BG=0xfff2f5ee, CARD=0xffffffff, INK=0xff172e25, MUTED=0xff476056,
@@ -43,6 +58,11 @@ public final class MainActivity extends Activity {
     private static final int TIMELINE_CAPTURE=42, EXPORT_PREVIEW=44;
     private static final ExecutorService IO=Executors.newSingleThreadExecutor();
     private static final ExecutorService PREVIEWS=Executors.newSingleThreadExecutor();
+    private static final ThreadPoolExecutor THUMBNAILS=new ThreadPoolExecutor(2,2,20,TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(48),new ThreadPoolExecutor.DiscardOldestPolicy());
+    private static final LruCache<String,Bitmap> THUMB_CACHE=new LruCache<String,Bitmap>(8*1024*1024) {
+        @Override protected int sizeOf(String key,Bitmap image){return image.getAllocationByteCount();}
+    };
     private ProjectStore store;
     private TimelineStore timeline;
     private SharedPreferences settings;
@@ -57,7 +77,9 @@ public final class MainActivity extends Activity {
     private TextView progressLabel;
     private ProgressBar progressBar;
     private LinearLayout screen;
-    private ScrollView scroll;
+    private ListView albumList;
+    private String visibleAlbum;
+    private final Map<String,int[]> scrollByAlbum=new HashMap<>();
     private String resultAlignment;
     private boolean pendingPreview, previewInFlight;
 
@@ -78,6 +100,11 @@ public final class MainActivity extends Activity {
             resultVideo=state.getBoolean("resultVideo");
             resultAlignment=state.getString("resultAlignment");
             cameraInFlight=state.getInt("cameraInFlight");
+            Bundle positions=state.getBundle("albumPositions");
+            if(positions!=null)for(String key:positions.keySet()) {
+                int[] value=positions.getIntArray(key);
+                if(value!=null && value.length==2)scrollByAlbum.put(key,value);
+            }
         }
         try {
             store=new ProjectStore(this);
@@ -114,6 +141,10 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onSaveInstanceState(Bundle out) {
         super.onSaveInstanceState(out);
+        rememberGalleryScroll();
+        Bundle positions=new Bundle();
+        for(Map.Entry<String,int[]> item:scrollByAlbum.entrySet())positions.putIntArray(item.getKey(),item.getValue());
+        out.putBundle("albumPositions",positions);
         out.putString("space",spaceId);
         out.putBoolean("allFrames",allFrames);
         out.putBoolean("pendingPreview",pendingPreview);
@@ -157,14 +188,15 @@ public final class MainActivity extends Activity {
         }
     }
     private void render() {
-        screenBase();
+        rememberGalleryScroll();albumList=null;visibleAlbum=null;
+        progressLabel=null;progressBar=null;
         JSONObject space=store.getSpace(spaceId);
         if(browsingProjects || space==null) home();
         else projectTimeline(space);
     }
     private void screenBase() {
         progressLabel=null; progressBar=null;
-        scroll=new ScrollView(this);
+        ScrollView scroll=new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setClipToPadding(false);
         scroll.setBackgroundColor(BG);
@@ -174,25 +206,140 @@ public final class MainActivity extends Activity {
         setContentView(scroll);
     }
     private void home() {
-        if(spaceId!=null) add(screen,action("‹  返回拍摄",TINT,DARK,v->onBackPressed()),0);
-        add(screen,text("原样  /  FRAME AGAIN",12,MUTED,true),spaceId==null?0:14);
-        heading("所有相册","把想长期记录的事，分开放在不同相册里。");
-        add(screen,action("＋ 新建相册",DARK,Color.WHITE,v->createAlbum()),20);
+        makeGalleryBase(null);
+        LinearLayout top=row();top.setGravity(Gravity.CENTER_VERTICAL);
+        if(spaceId!=null)top.addView(action("‹  返回拍摄",TINT,DARK,v->onBackPressed()),
+                new LinearLayout.LayoutParams(-2,dp(48)));
+        TextView title=text("所有相册",19,INK,true);
+        title.setGravity(Gravity.CENTER);
+        top.addView(title,new LinearLayout.LayoutParams(0,-2,1));
+        top.addView(action("新建相册",DARK,Color.WHITE,v->createAlbum()),new LinearLayout.LayoutParams(-2,dp(48)));
+        add(screen,top,0);
+
+        ArrayList<AlbumRow> albums=new ArrayList<>();
         for(int i=0;i<store.spaces.length();i++) {
-            JSONObject s=store.spaces.optJSONObject(i);
-            if(s==null) continue;
-            String name=albumName(s);
-            boolean last=s.optString("id").equals(settings.getString("last_project",null));
-            LinearLayout item=panel(CARD,18);
-            add(item,text(name,20,INK,true),0);
-            add(item,text(last?"上次拍摄    ›":"打开相机    ›",14,MUTED,false),5);
-            item.setContentDescription(name+"，打开相机");
-            item.setFocusable(true);
-            item.setOnClickListener(v->{setCurrentProject(s);if(!captureTimeline())render();});
-            add(screen,item,9);
+            JSONObject entry=store.spaces.optJSONObject(i);
+            if(entry==null)continue;
+            List<File> files=projectPhotos(entry);
+            albums.add(new AlbumRow(entry,files.size(),files.isEmpty()?null:files.get(files.size()-1)));
         }
-        add(screen,text("照片留在本机，只有你主动分享时才会发送。",12,MUTED,false),24);
+        mountList(new BaseAdapter() {
+            @Override public int getCount() {return albums.size();}
+            @Override public Object getItem(int p) {return albums.get(p);}
+            @Override public long getItemId(int p) {return p;}
+            @Override public boolean areAllItemsEnabled(){return false;}
+            @Override public boolean isEnabled(int p){return false;}
+            @Override public View getView(int p,View convert,ViewGroup parent) {
+                AlbumTile tile=convert==null?new AlbumTile():(AlbumTile)convert;
+                tile.bind(albums.get(p));
+                return tile;
+            }
+        });
     }
+    private static final class AlbumRow {
+        final JSONObject entry;
+        final int count;
+        final File cover;
+        AlbumRow(JSONObject entry,int count,File cover){this.entry=entry;this.count=count;this.cover=cover;}
+    }
+    private final class AlbumTile extends LinearLayout {
+        final ImageView cover;
+        final TextView label, detail;
+        AlbumTile() {
+            super(MainActivity.this);
+            setOrientation(HORIZONTAL);setGravity(Gravity.CENTER_VERTICAL);
+            setPadding(dp(9),dp(7),dp(9),dp(7));
+            setBackground(new RippleDrawable(ColorStateList.valueOf(0x18306955),rounded(CARD,13),null));
+            setFocusable(true);
+            cover=thumbnail();cover.setBackground(rounded(TINT,8));cover.setClipToOutline(true);
+            cover.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            addView(cover,new LinearLayout.LayoutParams(dp(56),dp(56)));
+            LinearLayout name=stack();LinearLayout.LayoutParams grow=new LinearLayout.LayoutParams(0,-2,1);
+            grow.leftMargin=dp(12);addView(name,grow);
+            label=text("",16,INK,true);label.setMaxLines(2);add(name,label,0);
+            detail=text("",13,MUTED,false);add(name,detail,3);
+            TextView arrow=text("›",22,MUTED,true);
+            arrow.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            addView(arrow,new LinearLayout.LayoutParams(-2,-2));
+        }
+        void bind(AlbumRow row) {
+            String name=albumName(row.entry);
+            label.setText(name);detail.setText(row.count+" 张照片");bindThumbnail(cover,row.cover);
+            setContentDescription(name+"，"+row.count+" 张照片，打开相机");
+            setOnClickListener(v->{setCurrentProject(row.entry);if(!captureTimeline())render();});
+        }
+    }
+
+    private void makeGalleryBase(String key) {
+        visibleAlbum=key==null?"all":key;
+        screen=stack();
+        screen.setBackgroundColor(BG);
+        screen.setPadding(dp(14),dp(8),dp(14),0);
+        setContentView(screen);
+    }
+    private void mountList(BaseAdapter adapter) {
+        albumList=new ListView(this);
+        albumList.setItemsCanFocus(true);
+        albumList.setDivider(null);
+        albumList.setSelector(android.R.color.transparent);
+        albumList.setClipToPadding(false);
+        albumList.setPadding(0,dp(8),0,dp(16));
+        albumList.setAdapter(adapter);
+        screen.addView(albumList,new LinearLayout.LayoutParams(-1,0,1));
+        int[] pos=scrollByAlbum.get(visibleAlbum);
+        if(pos!=null&&adapter.getCount()>0)
+            albumList.setSelectionFromTop(Math.min(pos[0],adapter.getCount()-1),pos[1]);
+    }
+    private void rememberGalleryScroll() {
+        if(albumList!=null && visibleAlbum!=null && albumList.getChildCount()>0)
+            scrollByAlbum.put(visibleAlbum,new int[]{albumList.getFirstVisiblePosition(),
+                    albumList.getChildAt(0).getTop()-albumList.getPaddingTop()});
+    }
+
+    private static final class ThumbRequest {
+        final String key;
+        Future<?> work;
+        ThumbRequest(String key){this.key=key;}
+    }
+    private ImageView thumbnail() {
+        ImageView image=new ImageView(this);
+        image.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        return image;
+    }
+    private void bindThumbnail(ImageView image,File file) {
+        String key=file==null?null:file.getAbsolutePath()+":"+file.lastModified();
+        Object previous=image.getTag();
+        if(previous instanceof ThumbRequest) {
+            ThumbRequest old=(ThumbRequest)previous;
+            if(old.work!=null && old.key.equals(key))return;
+            if(old.work!=null){old.work.cancel(true);THUMBNAILS.remove((Runnable)old.work);}
+        }
+        image.setTag(null);
+        image.setImageDrawable(null);
+        if(key==null)return;
+        ThumbRequest request=new ThumbRequest(key);
+        image.setTag(request);
+        Bitmap cached=THUMB_CACHE.get(key);
+        if(cached!=null){image.setImageBitmap(cached);return;}
+        WeakReference<ImageView> target=new WeakReference<>(image);
+        request.work=THUMBNAILS.submit(()->{
+            Bitmap bitmap=THUMB_CACHE.get(key);
+            if(bitmap==null) {
+                try{bitmap=PhotoTools.load(file,252);}catch(RuntimeException|OutOfMemoryError ignored){}
+                if(bitmap!=null)THUMB_CACHE.put(key,bitmap);
+            }
+            Bitmap result=bitmap;
+            new Handler(Looper.getMainLooper()).post(()->{
+                ImageView destination=target.get();
+                if(destination!=null&&destination.getTag()==request) {
+                    destination.setImageBitmap(result);
+                    request.work=null;
+                }
+            });
+        });
+    }
+
+    private static void enabled(View view,boolean enable){view.setEnabled(enable);view.setAlpha(enable?1f:.55f);}
     private static String albumName(JSONObject album) {
         // Display the old autogenerated default in the new vocabulary without moving any files.
         String name=album.optString("name");
@@ -246,127 +393,266 @@ public final class MainActivity extends Activity {
         return TimelineStore.select(days,picked);
     }
     private void projectTimeline(JSONObject space) {
+        makeGalleryBase(spaceId);
         LinearLayout top=row();
-        weighted(top,action("所有相册",TINT,DARK,v->showProjectList()),0);
-        weighted(top,action("继续拍摄",DARK,Color.WHITE,v->captureTimeline()),8);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        top.addView(action("所有相册",TINT,DARK,v->showProjectList()),new LinearLayout.LayoutParams(-2,dp(48)));
+        TextView title=text(albumName(space),18,INK,true);
+        title.setGravity(Gravity.CENTER);title.setMaxLines(2);
+        top.addView(title,new LinearLayout.LayoutParams(0,-2,1));
+        top.addView(action("继续拍摄",DARK,Color.WHITE,v->captureTimeline()),new LinearLayout.LayoutParams(-2,dp(48)));
         add(screen,top,0);
-        add(screen,text(albumName(space),30,INK,true),15);
+
         List<File> photos=projectPhotos(space);
         LinkedHashMap<String,List<File>> days=TimelineStore.days(photos);
-        add(screen,text(photos.size()+" 张照片  ·  "+days.size()+" 天",14,MUTED,false),5);
-        LinearLayout card=panel(DARK,20);
-        add(card,text("制作时序影像",22,Color.WHITE,true),0);
-        add(card,text("每天默认选最后一张，点日期可更换。测试时可用全部照片。",14,0xffdcece1,false),5);
-        LinearLayout mode=row();
-        weighted(mode,action((!allFrames?"✓ ":"")+"每天一张",!allFrames?LIME:0xffe4eee8,DARK,v->{allFrames=false;render();}),0);
-        weighted(mode,action((allFrames?"✓ ":"")+"全部记录",allFrames?LIME:0xffe4eee8,DARK,v->{allFrames=true;render();}),8);
-        add(card,mode,12);
-        List<File> frames=allFrames?photos:chosenFrames(days);
-        CheckBox align = new CheckBox(this);
-        align.setText("对齐人物");
-        align.setTextSize(15);
-        align.setTextColor(Color.WHITE);
-        align.setButtonTintList(ColorStateList.valueOf(LIME));
-        align.setMinHeight(dp(48));
-        align.setEnabled(frames.size()>1 && !exporting);
-        align.setAlpha(align.isEnabled()?1f:.50f);
-        String alignmentKey = "align_people_" + spaceId;
-        align.setChecked(frames.size()>1 && settings.getBoolean(alignmentKey,false));
-        align.setOnCheckedChangeListener((buttonView, checked)->settings.edit().putBoolean(alignmentKey,checked).apply());
-        add(card,align,8);
-        if (frames.size()>1) add(card,text("适合角度相近的单人照；仅影响导出的画面。",12,0xffdcece1,false),0);
-        TextView button=action(exporting?"正在生成…":"导出 GIF / MP4  ·  "+frames.size()+" 帧",LIME,DARK,
-                v->chooseFormat(frames,align.isChecked()));
-        button.setEnabled(frames.size()>0&&!exporting);
-        button.setAlpha(button.isEnabled()?1f:.52f);
-        add(card,button,8);
+        LinearLayout strip=row();
+        strip.setGravity(Gravity.CENTER_VERTICAL);
+        strip.addView(text(photos.size()+" 张照片  ·  "+days.size()+" 天",14,MUTED,false),
+                new LinearLayout.LayoutParams(0,-2,1));
+        TextView create=action("制作影像",LIME,DARK,v->showExportSheet(photos,days));
+        create.setEnabled(!photos.isEmpty()&&!exporting);
+        create.setAlpha(create.isEnabled()?1f:.48f);
+        strip.addView(create,new LinearLayout.LayoutParams(-2,dp(48)));
+        add(screen,strip,8);
         if(timelineExporting) {
+            LinearLayout card=panel(DARK,16);
             progressLabel=text("",13,0xffe8f5e8,true);
-            add(card,progressLabel,10);
+            add(card,progressLabel,0);
             progressBar=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);
             progressBar.setMax(100); progressBar.setContentDescription("影像导出进度");
             progressBar.setProgressTintList(ColorStateList.valueOf(LIME));
-            add(card,progressBar,6);
+            add(card,progressBar,4);
             updateProgress(exportPercent);
-            add(card,action("取消导出",TINT,DARK,v->cancelTimelineExport()),8);
+            add(card,action("取消导出",TINT,DARK,v->cancelTimelineExport()),6);
+            add(screen,card,6);
         } else if(resultFile!=null && resultFile.isFile() && spaceId.equals(resultProject)) {
-            if(resultAlignment!=null) add(card,text(resultAlignment,13,0xffe8f5e8,true),10);
-            add(card,action("查看上次导出结果",TINT,DARK,v->presentExport(resultFile,resultVideo)),8);
+            add(screen,action("查看上次导出结果",TINT,DARK,v->presentExport(resultFile,resultVideo)),6);
         }
-        add(screen,card,16);
-        add(screen,text("照片记录",18,INK,true),20);
-        if(days.isEmpty()) add(screen,text("还没有照片。拍一张后会在这里出现。",14,MUTED,false),8);
-        ArrayList<String> newest=new ArrayList<>(days.keySet());
+        if(photos.isEmpty()) {
+            TextView empty=text("这个相册还没有照片。拍下第一张，就从这里开始。",15,MUTED,false);
+            empty.setGravity(Gravity.CENTER);
+            screen.addView(empty,new LinearLayout.LayoutParams(-1,0,1));
+            return;
+        }
+        ArrayList<File> newest=new ArrayList<>(photos);
         Collections.reverse(newest);
-        for(String day:newest) {
-            List<File> group=days.get(day);
-            File pick=TimelineStore.pick(group,settings.getString(dayKey(day),null));
-            LinearLayout item=panel(CARD,16);
-            add(item,text(day,17,INK,true),0);
-            add(item,text(group.size()+" 张 · 选中 "+TimelineStore.time(pick)+" · 查看 / 删除    ›",13,MUTED,false),4);
-            item.setOnClickListener(v->pickForDay(day,group,pick));
-            item.setFocusable(true);
-            add(screen,item,8);
+        GalleryAdapter adapter=new GalleryAdapter(days,newest);
+        mountList(adapter);
+    }
+
+    private static final class GridRow {
+        final String date;
+        final int start, end, total;
+        GridRow(String date,int start,int end,int total) {
+            this.date=date;this.start=start;this.end=end;this.total=total;
+        }
+        boolean isHeader() {return start<0;}
+    }
+
+    private final class GalleryAdapter extends BaseAdapter {
+        private final Map<String,List<File>> days;
+        private final List<File> newest;
+        private final ArrayList<GridRow> rows=new ArrayList<>();
+        GalleryAdapter(LinkedHashMap<String,List<File>> days,List<File> newest) {
+            this.days=days;this.newest=newest;
+            ArrayList<String> keys=new ArrayList<>(days.keySet());
+            Collections.reverse(keys);
+            int start=0;
+            for(String key:keys) {
+                int size=days.get(key).size();
+                rows.add(new GridRow(key,-1,-1,size));
+                for(int x=start;x<start+size;x+=3)
+                    rows.add(new GridRow(key,x,Math.min(x+3,start+size),size));
+                start+=size;
+            }
+        }
+        @Override public int getCount() {return rows.size();}
+        @Override public Object getItem(int p) {return rows.get(p);}
+        @Override public long getItemId(int p) {return p;}
+        @Override public int getViewTypeCount() {return 2;}
+        @Override public int getItemViewType(int p) {return rows.get(p).isHeader()?0:1;}
+        @Override public boolean areAllItemsEnabled() {return false;}
+        @Override public boolean isEnabled(int p) {return false;}
+        @Override public View getView(int p,View convert,ViewGroup parent) {
+            GridRow data=rows.get(p);
+            if(data.isHeader()) {
+                TextView label=convert==null?text("",16,INK,true):(TextView)convert;
+                label.setText(data.date+"  ·  "+data.total+" 张");
+                label.setPadding(0,dp(14),0,dp(7));
+                if(android.os.Build.VERSION.SDK_INT>=28)label.setAccessibilityHeading(true);
+                return label;
+            }
+            LinearLayout container;
+            if(convert==null) {
+                container=row();
+                container.setPadding(0,0,0,dp(5));
+                for(int i=0;i<3;i++) {
+                    LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,-2,1);
+                    lp.leftMargin=i==0?0:dp(5);
+                    container.addView(new GalleryTile(),lp);
+                }
+            } else container=(LinearLayout)convert;
+            File picked=TimelineStore.pick(days.get(data.date),settings.getString(dayKey(data.date),null));
+            for(int i=0;i<3;i++) {
+                GalleryTile tile=(GalleryTile)container.getChildAt(i);
+                int index=data.start+i;
+                File file=index<data.end?newest.get(index):null;
+                tile.bind(file,picked,data.date,()->viewAlbumPhoto(newest,index,days,this));
+            }
+            return container;
         }
     }
-    private void pickForDay(String day,List<File> group,File selected) {
-        LinearLayout box=stack();
-        box.setPadding(dp(18),dp(8),dp(18),0);
-        ImageView preview=new ImageView(this);
-        preview.setBackground(rounded(DARK,12));
-        preview.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        preview.setContentDescription("当日照片预览");
-        box.addView(preview,new LinearLayout.LayoutParams(-1,dp(180)));
-        TextView indicator=text("",14,MUTED,true);
-        add(box,indicator,8);
-        LinearLayout buttons=row();
-        int[] index={Math.max(0,group.indexOf(selected))}, sequence={0};
-        Future<?>[] pending={null};
-        String key=dayKey(day);
-        TextView prev=action("上一张",TINT,DARK,null),next=action("下一张",TINT,DARK,null);
-        weighted(buttons,prev,0);weighted(buttons,next,8);add(box,buttons,8);
-        TextView remove=action("删除",TINT,0xff9b2c2c,null);
-        weighted(buttons,remove,8);
-        ScrollView content=new ScrollView(this);
-        content.addView(box);
-        AlertDialog dialog=new AlertDialog.Builder(this).setTitle(day+" · 照片").setView(content)
-            .setNegativeButton("关闭",null)
-            .setPositiveButton("设为当天选片",(d,w)->{
-                settings.edit().putString(key,group.get(index[0]).getName()).apply();
-                int y=scroll.getScrollY();render();
-                ScrollView refreshed=scroll; refreshed.post(()->refreshed.scrollTo(0,y));
-            }).create();
+
+    private final class GalleryTile extends FrameLayout {
+        final ImageView photo;
+        final TextView badge, time;
+        GalleryTile() {
+            super(MainActivity.this);
+            setBackground(rounded(TINT,10));
+            setClipToOutline(true);
+            setFocusable(true);
+            photo=thumbnail();
+            photo.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            addView(photo,new FrameLayout.LayoutParams(-1,-1));
+            badge=text("每日选片",10,DARK,true);
+            badge.setGravity(Gravity.CENTER);
+            badge.setPadding(dp(5),dp(2),dp(5),dp(2));
+            badge.setBackground(rounded(LIME,6));
+            badge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            FrameLayout.LayoutParams top=new FrameLayout.LayoutParams(-2,-2,Gravity.TOP|Gravity.START);
+            top.setMargins(dp(4),dp(4),0,0);addView(badge,top);
+            time=text("",11,Color.WHITE,true);
+            time.setPadding(dp(4),dp(2),dp(4),dp(2));
+            time.setBackground(rounded(0xb0172e25,6));
+            time.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            FrameLayout.LayoutParams bottom=new FrameLayout.LayoutParams(-2,-2,Gravity.BOTTOM|Gravity.END);
+            bottom.setMargins(0,0,dp(4),dp(4));addView(time,bottom);
+            setForeground(new RippleDrawable(ColorStateList.valueOf(0x45ffffff),null,
+                    rounded(Color.WHITE,10)));
+        }
+        @Override protected void onMeasure(int w,int h) {
+            int width=View.MeasureSpec.getSize(w);
+            super.onMeasure(w,View.MeasureSpec.makeMeasureSpec(width,View.MeasureSpec.EXACTLY));
+        }
+        void bind(File file,File selected,String date,Runnable open) {
+            bindThumbnail(photo,file);
+            if(file==null) {
+                setVisibility(View.INVISIBLE);
+                setOnClickListener(null);
+                setContentDescription(null);
+                return;
+            }
+            setVisibility(View.VISIBLE);
+            boolean picked=file.equals(selected);
+            badge.setVisibility(picked?View.VISIBLE:View.GONE);
+            String ts=TimelineStore.time(file);
+            time.setText(ts);
+            setContentDescription(date+" "+ts+(picked?"，每日选片":"")+"，查看照片");
+            setOnClickListener(v->open.run());
+        }
+    }
+
+    private void viewAlbumPhoto(List<File> newest,int selected,Map<String,List<File>> days,GalleryAdapter adapter) {
+        Dialog dialog=new Dialog(this,android.R.style.Theme_Material_NoActionBar);
+        LinearLayout layout=stack();layout.setBackgroundColor(0xff101914);
+        layout.setPadding(dp(16),dp(6),dp(16),dp(14));
+        LinearLayout header=row();header.setGravity(Gravity.CENTER_VERTICAL);
+        header.addView(action("返回相册",TINT,DARK,v->dialog.dismiss()),new LinearLayout.LayoutParams(-2,-2));
+        TextView counter=text("",14,Color.WHITE,true);
+        counter.setGravity(Gravity.CENTER);
+        header.addView(counter,new LinearLayout.LayoutParams(0,-2,1));
+        TextView remove=action("删除照片",0xff49312f,0xffffdddd,null);
+        header.addView(remove,new LinearLayout.LayoutParams(-2,-2));
+        add(layout,header,0);
+
+        ImageView image=new ImageView(this);
+        image.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        image.setContentDescription("全屏照片预览");
+        layout.addView(image,new LinearLayout.LayoutParams(-1,0,1));
+        TextView status=text("",14,0xffe0ecdf,true);status.setGravity(Gravity.CENTER);
+        status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);add(layout,status,4);
+        LinearLayout bar=row();
+        TextView prev=action("上一张",0xff28473a,Color.WHITE,null),next=action("下一张",0xff28473a,Color.WHITE,null);
+        weighted(bar,prev,0);weighted(bar,next,8);
+        add(layout,bar,8);
+        TextView pick=action("设为当天选片",LIME,DARK,null);
+        add(layout,pick,8);
+
+        int[] index={selected},sequence={0};
+        Future<?>[] job={null};
+        Bitmap[] shown={null};
+        boolean[] loaded={false};
+        Runnable clear=()->{
+            image.setImageDrawable(null);
+            shown[0]=null; // A displayed bitmap may still be referenced by the render thread.
+        };
+        Runnable update=()->{
+            File current=newest.get(index[0]);
+            String day=TimelineStore.day(current),key=dayKey(day);
+            boolean isPick=current.equals(TimelineStore.pick(days.get(day),settings.getString(key,null)));
+            counter.setText((index[0]+1)+" / "+newest.size());
+            status.setText(day+"   "+TimelineStore.time(current)
+                    +(isPick?"   ·   每日选片":"")+(loaded[0]?(shown[0]==null?"   ·   读图失败":""):"   ·   加载中"));
+            pick.setText(isPick?"已设为当天选片":"设为当天选片");
+            enabled(pick,!isPick&&loaded[0]&&shown[0]!=null);
+            enabled(remove,loaded[0]);
+            enabled(prev,index[0]>0);enabled(next,index[0]+1<newest.size());
+        };
         Runnable refresh=()->{
-            File f=group.get(index[0]);
-            if(pending[0]!=null) pending[0].cancel(true);
+            if(job[0]!=null)job[0].cancel(true);
             int rev=++sequence[0];
-            preview.setImageDrawable(null);
-            indicator.setText((index[0]+1)+" / "+group.size()+"    "+TimelineStore.time(f)+"  ·  加载中");
-            prev.setEnabled(index[0]>0); prev.setAlpha(prev.isEnabled()?1f:.45f);
-            next.setEnabled(index[0]+1<group.size()); next.setAlpha(next.isEnabled()?1f:.45f);
-            remove.setEnabled(false); remove.setAlpha(.5f);
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
-            pending[0]=PREVIEWS.submit(()->{
-                Bitmap image=PhotoTools.load(f,960);
+            File current=newest.get(index[0]);
+            loaded[0]=false;
+            clear.run();update.run();
+            job[0]=PREVIEWS.submit(()->{
+                Bitmap bitmap=null;
+                try{bitmap=PhotoTools.load(current,1400);}catch(RuntimeException|OutOfMemoryError ignored){}
+                Bitmap decoded=bitmap;
                 runOnUiThread(()->{
                     if(rev!=sequence[0]||!dialog.isShowing()||isDestroyed()){
-                        if(image!=null)image.recycle(); return;
+                        if(decoded!=null)decoded.recycle();
+                        return;
                     }
-                    preview.setImageBitmap(image);
-                    indicator.setText((index[0]+1)+" / "+group.size()+"    "+TimelineStore.time(f)+(image==null?"  ·  读图失败":""));
-                    remove.setEnabled(true); remove.setAlpha(1f);
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(image!=null);
+                    shown[0]=decoded;loaded[0]=true;
+                    if(decoded!=null)image.setImageBitmap(decoded);
+                    update.run();
                 });
             });
         };
         prev.setOnClickListener(v->{if(index[0]>0){index[0]--;refresh.run();}});
-        next.setOnClickListener(v->{if(index[0]+1<group.size()){index[0]++;refresh.run();}});
-        remove.setOnClickListener(v->confirmDelete(group.get(index[0]),key,dialog));
-        dialog.setOnDismissListener(d->{sequence[0]++;if(pending[0]!=null)pending[0].cancel(true);});
-
-        dialog.show();refresh.run();
+        next.setOnClickListener(v->{if(index[0]+1<newest.size()){index[0]++;refresh.run();}});
+        pick.setOnClickListener(v->{
+            File current=newest.get(index[0]);
+            settings.edit().putString(dayKey(TimelineStore.day(current)),current.getName()).apply();
+            adapter.notifyDataSetChanged();
+            update.run();
+        });
+        remove.setOnClickListener(v->{
+            File current=newest.get(index[0]);
+            confirmDelete(current,dayKey(TimelineStore.day(current)),dialog);
+        });
+        float[] touch={0,0};
+        image.setOnTouchListener((v,event)->{
+            if(event.getActionMasked()==MotionEvent.ACTION_DOWN){touch[0]=event.getX();touch[1]=event.getY();return true;}
+            if(event.getActionMasked()==MotionEvent.ACTION_UP){
+                float dx=event.getX()-touch[0],dy=event.getY()-touch[1];
+                if(Math.abs(dx)>dp(45)&&Math.abs(dx)>Math.abs(dy)*1.3f) {
+                    int target=index[0]+(dx<0?1:-1);
+                    if(target>=0&&target<newest.size()){index[0]=target;refresh.run();}
+                } else v.performClick();
+            }
+            return true;
+        });
+        dialog.setOnDismissListener(d->{sequence[0]++;if(job[0]!=null)job[0].cancel(true);clear.run();});
+        dialog.setContentView(layout);dialog.show();
+        Window win=dialog.getWindow();
+        if(win!=null){
+            win.setLayout(-1,-1);win.setStatusBarColor(0xff101914);win.setNavigationBarColor(0xff101914);
+            win.getDecorView().setSystemUiVisibility(0);
+        }
+        refresh.run();
     }
-    private void confirmDelete(File photo,String dayKey,AlertDialog preview) {
+    private void confirmDelete(File photo,String dayKey,Dialog preview) {
         if(exporting) {notice("请先完成或取消导出");return;}
         new AlertDialog.Builder(this).setTitle("删除照片？")
             .setMessage("只删除正在看的这一张。删除后无法恢复，不影响已保存到文件的 GIF 或 MP4。")
@@ -379,20 +665,64 @@ public final class MainActivity extends Activity {
                 }
                 if(!photo.delete()) {notice("删除失败，照片仍保留");return;}
                 if(photo.getName().equals(settings.getString(dayKey,null))) settings.edit().remove(dayKey).apply();
-                if(spaceId.equals(resultProject)) {resultProject=null; resultFile=null;}
-                int y=scroll.getScrollY();
+                if(spaceId.equals(resultProject)) {resultProject=null; resultFile=null;pendingPreview=false;}
                 preview.dismiss();
                 render();
-                ScrollView refreshed=scroll;
-                refreshed.post(()->refreshed.scrollTo(0,y));
                 notice("已删除照片");
             }).show();
     }
-    private void chooseFormat(List<File> frames,boolean alignPeople) {
-        if(exporting||frames.isEmpty())return;
-        new AlertDialog.Builder(this).setTitle("导出 "+frames.size()+" 帧")
-            .setItems(new String[]{"GIF 动图","MP4 视频"},(d,w)->exportTimeline(frames,w==1,alignPeople && frames.size()>1))
-            .setNegativeButton("取消",null).show();
+
+    private void showExportSheet(List<File> photos,LinkedHashMap<String,List<File>> days) {
+        if(exporting||photos.isEmpty())return;
+        Dialog sheet=new Dialog(this);
+        sheet.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout content=panel(CARD,23);content.setPadding(dp(21),dp(16),dp(21),dp(24));
+        LinearLayout header=row();header.setGravity(Gravity.CENTER_VERTICAL);
+        header.addView(text("制作影像",23,INK,true),new LinearLayout.LayoutParams(0,-2,1));
+        header.addView(action("关闭",TINT,DARK,v->sheet.dismiss()),new LinearLayout.LayoutParams(-2,dp(48)));
+        add(content,header,0);
+        TextView count=text("",14,MUTED,false);
+        add(content,count,3);
+
+        RadioGroup modes=new RadioGroup(this);
+        modes.setOrientation(RadioGroup.HORIZONTAL);
+        RadioButton daily=new RadioButton(this),all=new RadioButton(this);
+        daily.setText("每天一张");daily.setId(View.generateViewId());daily.setMinHeight(dp(46));
+        all.setText("全部照片");all.setId(View.generateViewId());all.setMinHeight(dp(46));
+        modes.addView(daily,new RadioGroup.LayoutParams(0,-2,1));
+        modes.addView(all,new RadioGroup.LayoutParams(0,-2,1));
+        modes.check(allFrames?all.getId():daily.getId());
+        add(content,modes,5);
+
+        String alignmentKey="align_people_"+spaceId;
+        CheckBox align=new CheckBox(this);align.setText("对齐人物");align.setMinHeight(dp(46));
+        align.setChecked(settings.getBoolean(alignmentKey,false));
+        align.setOnCheckedChangeListener((button,checked)->settings.edit().putBoolean(alignmentKey,checked).apply());
+        add(content,align,0);
+        add(content,text("适合角度相近的单人照，只改变导出画面。",12,MUTED,false),0);
+        Runnable sync=()->{
+            int frames=allFrames?photos.size():days.size();
+            count.setText(frames+" 帧 · 按拍摄时间排序");
+            enabled(align,frames>1);
+        };
+        modes.setOnCheckedChangeListener((group,id)->{allFrames=id==all.getId();sync.run();});
+        sync.run();
+        LinearLayout buttons=row();
+        weighted(buttons,action("GIF 动图",TINT,DARK,v->{
+            sheet.dismiss();exportTimeline(allFrames?photos:chosenFrames(days),false,align.isEnabled()&&align.isChecked());
+        }),0);
+        weighted(buttons,action("MP4 视频",DARK,Color.WHITE,v->{
+            sheet.dismiss();exportTimeline(allFrames?photos:chosenFrames(days),true,align.isEnabled()&&align.isChecked());
+        }),8);
+        add(content,buttons,10);
+        sheet.setContentView(content);
+        Window win=sheet.getWindow();
+        if(win!=null){
+            win.setBackgroundDrawableResource(android.R.color.transparent);
+            win.setGravity(Gravity.BOTTOM);
+        }
+        sheet.show();
+        if(win!=null)win.setLayout(-1,-2);
     }
     private void updateProgress(int percent) {
         exportPercent=Math.max(exportPercent,Math.max(0,Math.min(100,percent)));
