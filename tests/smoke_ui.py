@@ -18,7 +18,9 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_APP = 'com.yuanyang.camera'
-APP = 'com.yuanyang.camera.preview'
+APP = os.environ.get('YUANYANG_TEST_PACKAGE', 'com.yuanyang.camera.preview')
+if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+',APP):
+    raise ValueError('Invalid YUANYANG_TEST_PACKAGE application ID')
 ACTIVITY = f'{APP}/{SOURCE_APP}.MainActivity'
 PREVIEW = ROOT/'dist/yuan-yang-0.1.0-debug.apk'
 CURRENT = ROOT/'dist/yuan-yang-0.3.0-preview.apk'
@@ -198,7 +200,7 @@ def album_labels(album):
 def camera_nav(ui, album):
     left = ui.find('所有相册', predicate=lambda a:a.get('clickable')=='true')
     right = ui.find(album_labels(album), predicate=lambda a:a.get('clickable')=='true')
-    assert left[0] < right[0], f'Camera must put all albums left and current album right: {left}, {right}'
+    assert left[1] < right[1], f'Camera must put all albums in the header and current album in the shutter row: {left}, {right}'
 
 def enter_album(ui, album):
     ui.tap(album_labels(album), predicate=lambda a:a.get('clickable')=='true')
@@ -413,7 +415,7 @@ def main():
     p.add_argument('--wait-boot', type=int, default=120)
     p.add_argument('--preview', type=Path, default=PREVIEW)
     p.add_argument('--apk', type=Path, default=CURRENT)
-    p.add_argument('--package', default=APP, help='APK application ID (defaults to isolated 0.3 preview)')
+    p.add_argument('--package', default=APP, help='APK application ID (defaults to YUANYANG_TEST_PACKAGE or isolated preview)')
     p.add_argument('--out', type=Path, default=ROOT/'dist/device-smoke')
     p.add_argument('--expected-album', '--expected-project', dest='expected_album')
     p.add_argument('--existing-two', action='store_true')

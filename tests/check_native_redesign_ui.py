@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""0.6 native-gallery and camera QA on a disposable, synthetic Android emulator.
+"""Native-gallery and camera QA on a disposable, synthetic Android emulator.
 
 Pass --apk for an in-place APK update (same package and signer as the source test
 install). Reuse the known 0.5 emulator's eight-image default synthetic album
@@ -78,6 +78,17 @@ def facing_in_system(ui):
 
 def camera_review(ui,args,tree,shutter):
     img,before=expect_center(ui,tree,shutter,'native-camera-entry')
+    album=active_action(tree,f'打开当前相册：{args.album}')
+    library=active_action(tree,'所有相册')
+    album_center=center(album)
+    assert album_center[0]<before[0] and abs(album_center[1]-before[1])<=3,(
+        'current album shortcut must occupy lower-left shutter row',album_center,before)
+    assert center(library)[1] < album_center[1], 'All albums stays in the header'
+    x1,y1,x2,y2=bounds(album)
+    assert min(x2-x1,y2-y1)>=48*density(ui)/160-1, 'album shortcut target below 48dp'
+    assert not any(n.get('text')==args.album and n.get('clickable')=='true'
+        for n in tree.iter('node')), 'Duplicate album text shortcut on camera'
+    passed('bottom-left current album shortcut is distinct from the header and shutter')
     cnt=facing_in_system(ui)
     current=match(tree,(*FRONT,*REAR),enabled=True)
     if args.facing=='single':
@@ -102,7 +113,7 @@ def camera_review(ui,args,tree,shutter):
         tree=updated
     if args.photos:
         ghost=active_action(tree,OVERLAY)
-        assert center(ghost)[0]<before[0],'Overlay adjustment must be left of shutter'
+        assert center(ghost)[1]<album_center[1],'Overlay settings must be separate from the shutter row'
         assert match(tree,SLIDER) is None,'Overlay slider should start collapsed'
         tap_node(ui,ghost)
         opened,_=window(ui,SLIDER)

@@ -7,17 +7,19 @@ LEGACY=${ANDROID_BUILD_TOOLS_DIR:-$APP/../android-build-tools}
 MAIN="$APP/app/src/main"
 BUILD="$APP/build"
 DIST="$APP/dist"
-VERSION=0.6.0
+VERSION=0.7.0
 MEDIAPIPE=${YUANYANG_MEDIAPIPE_DIR:-$APP/.toolchain/mediapipe}
 QA_DEBUGGABLE=${YUANYANG_QA_DEBUGGABLE:-0}
 ABIS=${YUANYANG_ABIS:-universal}
 ORIGINAL_CERT=94c0f46dafdd9d4f903aa360b0b9c61161f0326b97ee21dc2dd7b6a150b8439e
-if [[ ${1:-} == --preview ]]; then
+PARALLEL_PREVIEW=0
+if [[ $# == 1 && ( $1 == --preview || $1 == --parallel-preview ) ]]; then
     PREVIEW=1
+    if [[ $1 == --parallel-preview ]]; then PARALLEL_PREVIEW=1; fi
 elif [[ $# == 0 ]]; then
     PREVIEW=0
 else
-    echo "Usage: ./build-apk.sh [--preview]" >&2; exit 2
+    echo "Usage: ./build-apk.sh [--preview|--parallel-preview]" >&2; exit 2
 fi
 if [[ "$QA_DEBUGGABLE" != 0 && "$QA_DEBUGGABLE" != 1 ]] || (( QA_DEBUGGABLE && ! PREVIEW )); then
     echo "YUANYANG_QA_DEBUGGABLE=1 is allowed only with --preview." >&2; exit 2
@@ -42,6 +44,11 @@ else
     export LD_LIBRARY_PATH="$LEGACY/root/usr/lib/x86_64-linux-gnu/android:$LEGACY/root/usr/lib/x86_64-linux-gnu:$LEGACY/root/usr/lib:$LEGACY/root/usr/lib/7zip${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     D8=(java -cp "$LEGACY/jars/r8.jar" com.android.tools.r8.D8)
     SIGNER=(java -jar "$LEGACY/root/usr/share/java/apksigner.jar")
+fi
+# Allow a newer Android D8 when the SDK-bundled version cannot read the local compiler's classes.
+if [[ -n "${ANDROID_D8_JAR:-}" ]]; then
+    [[ -f "$ANDROID_D8_JAR" ]] || { echo 'ANDROID_D8_JAR is not a file.' >&2; exit 1; }
+    D8=(java -cp "$ANDROID_D8_JAR" com.android.tools.r8.D8)
 fi
 [[ -s "$ANDROID_JAR" && -x "$AAPT2" && -x "$ZIPALIGN" ]] || {
     printf '%s\n' 'Set ANDROID_SDK_ROOT to an SDK with platform 34/build-tools 34.0.0, or configure the local AOSP toolchain.' >&2
@@ -120,10 +127,16 @@ sed '/android:name="android.permission.INTERNET".*tools:node="remove"/d' \
     "$MAIN/AndroidManifest.xml" > "$TMP/ManifestPrivacy.xml"
 MANIFEST="$TMP/ManifestPrivacy.xml"
 if (( PREVIEW )); then
-    sed -e 's/package="com.yuanyang.camera"/package="com.yuanyang.camera.preview"/' \
+    PREVIEW_PACKAGE=com.yuanyang.camera.preview
+    PREVIEW_LABEL=原样测试版
+    if (( PARALLEL_PREVIEW )); then
+        PREVIEW_PACKAGE=com.yuanyang.camera.parallel
+        PREVIEW_LABEL="原样 · 并行测试版"
+    fi
+    sed -e "s/package=\"com.yuanyang.camera\"/package=\"$PREVIEW_PACKAGE\"/" \
         -e 's/android:name="\.\(MainActivity\|CaptureActivity\|ExportPreviewActivity\|ShareProvider\)"/android:name="com.yuanyang.camera.\1"/g' \
-        -e 's/android:authorities="com.yuanyang.camera.share"/android:authorities="com.yuanyang.camera.preview.share"/' \
-        -e 's/android:label="原样"/android:label="原样测试版"/' "$MANIFEST" > "$TMP/AndroidManifest.xml"
+        -e "s/android:authorities=\"com.yuanyang.camera.share\"/android:authorities=\"$PREVIEW_PACKAGE.share\"/" \
+        -e "s/android:label=\"原样\"/android:label=\"$PREVIEW_LABEL\"/" "$MANIFEST" > "$TMP/AndroidManifest.xml"
     MANIFEST="$TMP/AndroidManifest.xml"
 fi
 qa_args=()
@@ -149,6 +162,10 @@ if (( PREVIEW )); then
     SUFFIX=preview
     if (( QA_DEBUGGABLE )); then SUFFIX=qa; fi
     if [[ "$ABIS" != universal ]]; then SUFFIX=phone; fi
+    if (( PARALLEL_PREVIEW )); then
+        KEY="$BUILD/parallel-preview.keystore"
+        SUFFIX="parallel-$SUFFIX"
+    fi
 elif [[ ! -f "$KEY" ]]; then
     echo "Original signing keystore required for an in-place upgrade. Set YUANYANG_KEYSTORE or use --preview." >&2
     exit 1
@@ -169,6 +186,7 @@ fi
 REPORT_SUFFIX=
 if (( QA_DEBUGGABLE )); then REPORT_SUFFIX=-qa; fi
 if [[ "$ABIS" != universal ]]; then REPORT_SUFFIX=-phone; fi
+if (( PARALLEL_PREVIEW )); then REPORT_SUFFIX="-parallel$REPORT_SUFFIX"; fi
 cp "$TMP/apk-signature-report.txt" "$DIST/apk-signature-report$REPORT_SUFFIX.txt"
 "$ZIPALIGN" -c -v 4 "$TMP/signed.apk" > "$DIST/apk-alignment-report$REPORT_SUFFIX.txt"
 "$AAPT" dump badging "$TMP/signed.apk" > "$DIST/apk-manifest-report$REPORT_SUFFIX.txt"

@@ -173,18 +173,14 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         header.addView(albumListButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         View spacer = new View(this);
         header.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
-        currentAlbumButton = action(label);
-        currentAlbumButton.setSingleLine(true);
-        currentAlbumButton.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        currentAlbumButton.setMinWidth(dp(92));
-        currentAlbumButton.setMaxWidth(dp(164));
-        currentAlbumButton.setSelected(true);
-        currentAlbumButton.setContentDescription("打开当前相册：" + label);
-        currentAlbumButton.setOnClickListener(v -> leave(RESULT_OPEN_PROJECT));
-        LinearLayout.LayoutParams currentAlbumParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48));
-        currentAlbumParams.leftMargin = dp(10);
-        header.addView(currentAlbumButton, currentAlbumParams);
+        overlaySettings = action("叠影设置");
+        overlaySettings.setSingleLine(true);
+        overlaySettings.setOnClickListener(v -> {
+            overlayPanelExpanded = !overlayPanelExpanded;
+            refreshOverlayControls();
+        });
+        header.addView(overlaySettings, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         root.addView(header);
 
         FrameLayout stage = new FrameLayout(this);
@@ -274,12 +270,11 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         root.addView(actions, actionsParams);
         actions.addView(shutter, new FrameLayout.LayoutParams(dp(72), dp(72), Gravity.CENTER));
 
-        overlaySettings = new GlyphButton(GlyphButton.OVERLAY);
-        overlaySettings.setOnClickListener(v -> {
-            overlayPanelExpanded = !overlayPanelExpanded;
-            refreshOverlayControls();
-        });
-        actions.addView(overlaySettings, new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.LEFT | Gravity.CENTER_VERTICAL));
+        currentAlbumButton = new GlyphButton(GlyphButton.ALBUM);
+        labelGlyph(currentAlbumButton, "打开当前相册：" + label);
+        currentAlbumButton.setOnClickListener(v -> leave(RESULT_OPEN_PROJECT));
+        actions.addView(currentAlbumButton, new FrameLayout.LayoutParams(
+                dp(56), dp(56), Gravity.LEFT | Gravity.CENTER_VERTICAL));
 
         switchCamera = new GlyphButton(GlyphButton.FLIP);
         switchCamera.setOnClickListener(v -> switchFacing());
@@ -295,7 +290,8 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         overlayControls.setVisibility(hasReference && overlayPanelExpanded ? View.VISIBLE : View.GONE);
         overlaySettings.setVisibility(hasReference ? View.VISIBLE : View.INVISIBLE);
         overlaySettings.setSelected(overlayPanelExpanded);
-        labelGlyph(overlaySettings, overlayPanelExpanded ? "收起叠影设置" : "叠影设置");
+        overlaySettings.setText(overlayPanelExpanded ? "收起叠影设置" : "叠影设置");
+        currentAlbumButton.invalidate();
         overlayToggle.setText(overlayVisible ? "隐藏叠影" : "显示叠影");
         overlayToggle.setSelected(overlayVisible);
         overlaySlider.setEnabled(overlayVisible);
@@ -748,7 +744,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
 
     /** Local vectors keep the three fixed touch targets independent of font scale. */
     private final class GlyphButton extends Button {
-        static final int SHUTTER = 0, OVERLAY = 1, FLIP = 2;
+        static final int SHUTTER = 0, ALBUM = 1, FLIP = 2;
         final int glyph;
         final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         final Path path = new Path();
@@ -786,6 +782,29 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
                 canvas.drawCircle(cx, cy, dp(25), paint);
                 return;
             }
+            if (glyph == ALBUM && oldPhoto != null && !oldPhoto.isRecycled()) {
+                float width = dp(44);
+                float left = (getWidth() - width) / 2f, top = (getHeight() - width) / 2f;
+                RectF tile = new RectF(left, top, left + width, top + width);
+                float radius = dp(10);
+                path.reset();
+                path.addRoundRect(tile, radius, radius, Path.Direction.CW);
+                int clip = canvas.save();
+                canvas.clipPath(path);
+                float scale = Math.max(width / oldPhoto.getWidth(), width / oldPhoto.getHeight());
+                float halfWidth = oldPhoto.getWidth() * scale / 2f;
+                float halfHeight = oldPhoto.getHeight() * scale / 2f;
+                paint.setStyle(Paint.Style.FILL);
+                paint.setFilterBitmap(true);
+                canvas.drawBitmap(oldPhoto, null, new RectF(tile.centerX() - halfWidth, tile.centerY() - halfHeight,
+                        tile.centerX() + halfWidth, tile.centerY() + halfHeight), paint);
+                canvas.restoreToCount(clip);
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(dp(1));
+                paint.setColor(isEnabled() ? WHITE : MUTED);
+                canvas.drawRoundRect(tile, radius, radius, paint);
+                return;
+            }
             int save = canvas.save();
             float px = dp(26);
             canvas.translate((getWidth() - px) / 2f, (getHeight() - px) / 2f);
@@ -795,7 +814,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             paint.setStrokeCap(Paint.Cap.ROUND);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(1.8f);
-            if (glyph == OVERLAY) {
+            if (glyph == ALBUM) {
                 canvas.drawRoundRect(6f, 7f, 21.5f, 20.5f, 2f, 2f, paint);
                 path.reset();
                 path.moveTo(2.5f, 16f);

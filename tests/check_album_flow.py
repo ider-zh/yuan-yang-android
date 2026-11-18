@@ -39,7 +39,7 @@ def exists(nodes, word):
 def camera(nodes, album):
     l=find(nodes,'所有相册',clickable=True)
     r=find(nodes,'打开当前相册：'+album,clickable=True)
-    assert int(locate(l)[0]) < int(locate(r)[0])
+    assert int(locate(l)[1]) < int(locate(r)[1])
     return l,r
 
 def open_date(nodes):
