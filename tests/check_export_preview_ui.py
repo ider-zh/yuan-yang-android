@@ -130,12 +130,8 @@ def open_album(ui, album, frames):
     tree,_=window(ui,(EXPORT,*album_labels(album)),contains=True)
     if match(tree,EXPORT,contains=True) is None:
         target=match(tree,album_labels(album),clickable=True)
-        if target is None:
-            # Earlier API28 emulation can restore camera with coarse accessibility
-            # tree; system Back is the app's supported "current album" camera route.
-            ui.back()
-        else:
-            tap_node(ui,target)
+        assert target is not None, 'Current album shortcut unavailable'
+        tap_node(ui,target)
         tree,_=window(ui,EXPORT,contains=True)
     assert match(tree,f'{frames} 张照片',contains=True) is not None, 'Unexpected synthetic album item count'
     all_photo=match(tree,'全部记录',contains=True,enabled=True,clickable=True)

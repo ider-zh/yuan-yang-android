@@ -50,6 +50,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     public static final String EXTRA_PROJECT = "project";
     public static final String RESULT_OPEN_ALBUM_LIST = "open_album_list";
     public static final String RESULT_OPEN_PROJECT = "open_project";
+    public static final String RESULT_EXIT_APP = "exit_app";
     private static final int REQUEST_CAMERA = 72;
     private static final int NO_CAMERA = -1;
     private static final String CAMERA_FACING_KEY = "cameraFacing";
@@ -683,7 +684,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         try { previous.release(); } catch (RuntimeException ignored) {}
     }
 
-    @Override public void onBackPressed() { leave(RESULT_OPEN_PROJECT); }
+    @Override public void onBackPressed() { leave(RESULT_EXIT_APP); }
 
     private void leave(String destination) {
         if (isFinishing() || queuedNavigation != null) return;
@@ -691,7 +692,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             queuedNavigation = destination;
             albumListButton.setEnabled(false);
             currentAlbumButton.setEnabled(false);
-            hint.setText("正在保存，完成后打开相册…");
+            hint.setText(RESULT_EXIT_APP.equals(destination)?"正在保存，完成后退出…":"正在保存，完成后打开相册…");
             return;
         }
         finishNavigation(destination);

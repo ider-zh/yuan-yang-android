@@ -37,6 +37,13 @@ def in_camera(ui):
         time.sleep(.3)
     raise AssertionError('Camera shutter never became enabled')
 
+def open_current_album(ui):
+    tree,_=window(ui,'打开当前相册：',contains=True)
+    target=match(tree,'打开当前相册：',contains=True,enabled=True,clickable=True)
+    assert target is not None, 'Current album shortcut unavailable'
+    tap_node(ui,target)
+
+
 def assure_facing(ui,target):
     expected=BACK if target=='front' else FRONT
     for _ in range(5):
@@ -75,17 +82,16 @@ def run(args):
     if args.expect=='dual' and n is not None and n<2:
         raise AssertionError(f'Dual-facing fixture required, Android camera count is {n}')
     if not args.on_album:ui.launch(stop=True)
-    # Hardware Back from Camera is the supported current-album route; on-album
-    # resumes after the renderer test without restarting or reinitializing camera.
+    # Use the dedicated album shortcut; camera Back must not open an album.
     if not args.on_album:
-        in_camera(ui); ui.back()
+        open_current_album(ui)
     before=get_count(ui)
     tree=in_camera(ui)
     if args.expect=='single':
         assert match(tree,(*FRONT,*BACK)) is None,'Switch control should be hidden with only one facing'
         ui.screenshot('single-facing-switch-hidden')
         capture_and_check(ui,tree)
-        ui.back()
+        open_current_album(ui)
         after=get_count(ui)
         assert after==before+1,(before,after)
         passed('single-facing Android device hides switch and still captures')
@@ -100,7 +106,7 @@ def run(args):
         capture_and_check(ui,front,expected='front')
         info(ui,'front')
         passed('front switch opens front camera; taking a photo preserves that facing')
-        ui.back()
+        open_current_album(ui)
         after=get_count(ui)
         assert after==before+2,(before,after)
         in_camera(ui)

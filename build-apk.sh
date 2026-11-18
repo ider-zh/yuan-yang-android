@@ -7,11 +7,12 @@ LEGACY=${ANDROID_BUILD_TOOLS_DIR:-$APP/../android-build-tools}
 MAIN="$APP/app/src/main"
 BUILD="$APP/build"
 DIST="$APP/dist"
-VERSION=0.7.0
+VERSION=0.7.1
 MEDIAPIPE=${YUANYANG_MEDIAPIPE_DIR:-$APP/.toolchain/mediapipe}
 QA_DEBUGGABLE=${YUANYANG_QA_DEBUGGABLE:-0}
 ABIS=${YUANYANG_ABIS:-universal}
 ORIGINAL_CERT=94c0f46dafdd9d4f903aa360b0b9c61161f0326b97ee21dc2dd7b6a150b8439e
+PARALLEL_CERT=aaaf9b17181234e4e7e749405870c40c1338aede19e0b1f95691bcd421dddd2b
 PARALLEL_PREVIEW=0
 if [[ $# == 1 && ( $1 == --preview || $1 == --parallel-preview ) ]]; then
     PREVIEW=1
@@ -170,6 +171,9 @@ elif [[ ! -f "$KEY" ]]; then
     echo "Original signing keystore required for an in-place upgrade. Set YUANYANG_KEYSTORE or use --preview." >&2
     exit 1
 fi
+if (( PARALLEL_PREVIEW )) && [[ ! -f "$KEY" ]]; then
+    echo "Existing 0.7 parallel signing keystore is required for an in-place upgrade; refusing to create another key." >&2; exit 1
+fi
 if [[ ! -e "$KEY" ]]; then
     umask 077
     keytool -genkeypair -keystore "$KEY" -storepass android -keypass android -alias androiddebugkey \
@@ -182,6 +186,9 @@ APK="$DIST/yuan-yang-$VERSION-$SUFFIX.apk"
 "${SIGNER[@]}" verify --verbose --print-certs "$TMP/signed.apk" > "$TMP/apk-signature-report.txt"
 if (( ! PREVIEW )) && ! grep -q "certificate SHA-256 digest: $ORIGINAL_CERT" "$TMP/apk-signature-report.txt"; then
     echo "Refusing an incompatible in-place upgrade: signer does not match the original APK." >&2; exit 1
+fi
+if (( PARALLEL_PREVIEW )) && ! grep -Fqx "Signer #1 certificate SHA-256 digest: $PARALLEL_CERT" "$TMP/apk-signature-report.txt"; then
+    echo "Refusing an incompatible parallel upgrade: signer does not match 0.7.0." >&2; exit 1
 fi
 REPORT_SUFFIX=
 if (( QA_DEBUGGABLE )); then REPORT_SUFFIX=-qa; fi

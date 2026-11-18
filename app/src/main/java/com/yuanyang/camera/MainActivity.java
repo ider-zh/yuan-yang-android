@@ -70,7 +70,7 @@ public final class MainActivity extends Activity {
     private ProjectStore store;
     private TimelineStore timeline;
     private SharedPreferences settings;
-    private boolean allFrames, browsingProjects, isForeground;
+    private boolean allFrames, browsingProjects, listFromAlbum, isForeground;
     private String spaceId;
     private boolean exporting, timelineExporting;
     private int exportGeneration, exportPercent, cameraInFlight;
@@ -99,6 +99,7 @@ public final class MainActivity extends Activity {
             pendingPreview=state.getBoolean("pendingPreview");
             previewInFlight=state.getBoolean("previewInFlight");
             browsingProjects=state.getBoolean("browsingProjects");
+            listFromAlbum=state.getBoolean("listFromAlbum");
             resultProject=state.getString("resultProject");
             String path=state.getString("resultFile");
             if(path!=null) resultFile=new File(path);
@@ -141,7 +142,7 @@ public final class MainActivity extends Activity {
     }
     private void setCurrentProject(JSONObject project) {
         spaceId=project.optString("id");
-        allFrames=false; browsingProjects=false;
+        allFrames=false; browsingProjects=false; listFromAlbum=false;
         settings.edit().putString("last_project",spaceId).apply();
     }
     @Override protected void onSaveInstanceState(Bundle out) {
@@ -155,6 +156,7 @@ public final class MainActivity extends Activity {
         out.putBoolean("pendingPreview",pendingPreview);
         out.putBoolean("previewInFlight",previewInFlight);
         out.putBoolean("browsingProjects",browsingProjects);
+        out.putBoolean("listFromAlbum",listFromAlbum);
         out.putString("resultProject",resultProject);
         out.putString("resultFile",resultFile==null?null:resultFile.getPath());
         out.putBoolean("resultVideo",resultVideo);
@@ -174,20 +176,33 @@ public final class MainActivity extends Activity {
         if(exportTask!=null)exportTask.cancel(true);
         super.onDestroy();
     }
-    private void showProjectList() { browsingProjects=true; render(); }
+    private void showProjectList() { browsingProjects=true; listFromAlbum=true; render(); }
     @Override public void onBackPressed() {
         if(albumSelectionMode!=null) {albumSelectionMode.finish();return;}
-        if(browsingProjects) {
+        if(timelineExporting) {cancelTimelineExport();return;}
+        if(cameraInFlight!=0) return;
+        if(browsingProjects && listFromAlbum) {
             browsingProjects=false;
-            if(!captureTimeline()) render();
-        } else if(timelineExporting) cancelTimelineExport();
-        else finish();
+            listFromAlbum=false;
+            render();
+            return;
+        }
+        if(spaceId!=null) {
+            captureTimeline(); // If camera launch fails, keep the current screen available.
+            return;
+        }
+        finish();
     }
     @Override protected void onActivityResult(int req,int result,Intent data) {
         super.onActivityResult(req,result,data);
         if(req==cameraInFlight) cameraInFlight=0;
         if(req==EXPORT_PREVIEW) { previewInFlight=false; return; }
         if(req==TIMELINE_CAPTURE && store!=null) {
+            if(result==RESULT_OK && data!=null && data.getBooleanExtra(CaptureActivity.RESULT_EXIT_APP,false)) {
+                finish();
+                return;
+            }
+            listFromAlbum=false;
             browsingProjects=result==RESULT_OK && data!=null
                 && data.getBooleanExtra(CaptureActivity.RESULT_OPEN_ALBUM_LIST,false);
             render();
@@ -215,7 +230,7 @@ public final class MainActivity extends Activity {
     private void home() {
         makeGalleryBase(null);
         LinearLayout top=row();top.setGravity(Gravity.CENTER_VERTICAL);
-        if(spaceId!=null)top.addView(action("‹  返回拍摄",TINT,DARK,v->onBackPressed()),
+        if(spaceId!=null)top.addView(action(listFromAlbum?"‹  返回相册":"‹  返回拍摄",TINT,DARK,v->onBackPressed()),
                 new LinearLayout.LayoutParams(-2,dp(48)));
         TextView title=text("所有相册",19,INK,true);
         title.setGravity(Gravity.CENTER);

@@ -1,12 +1,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
-    package="com.yuanyang.camera" android:versionCode="8" android:versionName="0.7.0">
+    package="com.yuanyang.camera" android:versionCode="9" android:versionName="0.7.1">
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <application android:label="原样" android:icon="@drawable/ic_app"
-        android:theme="@style/AppTheme" android:allowBackup="false" android:supportsRtl="true">
+        android:theme="@style/AppTheme" android:allowBackup="false" android:supportsRtl="true"
+        android:enableOnBackInvokedCallback="false">
         <activity android:name=".CaptureActivity" android:screenOrientation="portrait" android:exported="false" />
         <activity android:name=".ExportPreviewActivity" android:exported="false" />
         <activity android:name=".MainActivity" android:launchMode="singleTop" android:screenOrientation="portrait" android:exported="true">
