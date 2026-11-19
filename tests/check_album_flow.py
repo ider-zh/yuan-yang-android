@@ -69,7 +69,7 @@ if not args.resume_confirmation:
     # Take two real virtual-camera photos without seeding app-private files.
     shutter=locate(find(start,'拍照',clickable=True))
     ui.shell('input','tap',*shutter)
-    ui.find('隐藏叠影',require_enabled=True)
+    ui.find('叠影？滑块拖到最左就是隐藏')
     ui.find(('拍照','复拍'),require_enabled=True)
     ui.tap(('拍照','复拍'),require_enabled=True)
     time.sleep(1.2)

@@ -282,8 +282,8 @@ def verify_deletion(ui, album):
     ui.tap('继续拍摄', require_enabled=True)
     camera_nav(ui, album)
     ui.find('拍照', require_enabled=True)
-    assert not any(n.attrib.get('text') in ('隐藏叠影','显示叠影')
-                   for n in ui.snapshot().iter('node')), 'Overlay button still shown after deleting the final photo'
+    assert not any(n.attrib.get('content-desc') == '旧照片叠影透明度'
+                   for n in ui.snapshot().iter('node')), 'Overlay slider still shown after deleting the final photo'
     ui.screenshot('no-overlay-after-delete')
     passed('deleting the last photo removes its overlay from the album camera')
 
@@ -329,13 +329,20 @@ def timeline_walkthrough(ui, upgraded=False, opts=None):
         ui.screenshot('first-overlay')
         passed('first shutter created one local JPEG and returned to capture')
         if opts.overlay_controls:
-            ui.tap('隐藏叠影', require_enabled=True)
-            ui.find('显示叠影')
+            ui.find('叠影？滑块拖到最左就是隐藏')
+            slider = next(n for n in ui.snapshot().iter('node')
+                          if n.get('content-desc') == '旧照片叠影透明度' and n.get('enabled') == 'true')
+            x1, y1, x2, y2 = map(int, re.findall(r'\d+', slider.attrib['bounds']))
+            y = str((y1+y2)//2)
+            ui.shell('input', 'swipe', str((x1+x2)//2), y, str(x1+1), y, '300')
+            ui.find('0%')
+            ui.find('叠影已隐藏', contains=True)
             ui.screenshot('overlay-hidden')
-            ui.tap('显示叠影', require_enabled=True)
-            ui.find('隐藏叠影')
+            ui.shell('input', 'swipe', str(x1+1), y, str(x2-2), y, '300')
+            ui.find('100%')
+            ui.find('移动手机，手动对齐旧照。', contains=True)
             ui.screenshot('overlay-restored')
-            passed('overlay hide/restore controls')
+            passed('overlay slider hides at zero and restores when moved right')
         capture(ui, ('拍照','复拍'), 2, album)
         passed('second shutter produced an additional file and returned to capture')
     enter_album(ui, album)
