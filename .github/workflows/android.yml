@@ -22,11 +22,15 @@ jobs:
           export JAVA_HOME="$JAVA_HOME_17_X64"
           export PATH="$JAVA_HOME/bin:$PATH"
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          mkdir -p .toolchain
+          curl --fail --silent --show-error --location --retry 3 \
+            https://dl.google.com/dl/android/maven2/com/android/tools/r8/9.5.28/r8-9.5.28.jar -o .toolchain/r8.jar
+          echo '38a9ffaaebbd17d1514e3ecbff5a85b989bb13c551b9e224c7409514eea84ff5  .toolchain/r8.jar' | sha256sum --check
           bash tests/check-timeline.sh
           bash tests/check-timelapse-media.sh
           bash tests/check-pose-alignment.sh
           bash fetch-mediapipe.sh
-          bash build-apk.sh --preview
+          ANDROID_D8_JAR="$PWD/.toolchain/r8.jar" bash build-apk.sh --preview
 
   release:
     needs: test
@@ -54,6 +58,10 @@ jobs:
           export JAVA_HOME="$JAVA_HOME_17_X64"
           export PATH="$JAVA_HOME/bin:$PATH"
           sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          mkdir -p .toolchain
+          curl --fail --silent --show-error --location --retry 3 \
+            https://dl.google.com/dl/android/maven2/com/android/tools/r8/9.5.28/r8-9.5.28.jar -o .toolchain/r8.jar
+          echo '38a9ffaaebbd17d1514e3ecbff5a85b989bb13c551b9e224c7409514eea84ff5  .toolchain/r8.jar' | sha256sum --check
           bash fetch-mediapipe.sh
       - name: Sign and verify the formal Android APK
         shell: bash
@@ -73,7 +81,7 @@ jobs:
           : "${KEYSTORE_B64:?Missing release signing keystore secret}"
           printf '%s' "$KEYSTORE_B64" | base64 --decode > "$YUANYANG_KEYSTORE"
           unset KEYSTORE_B64
-          bash build-apk.sh --release
+          ANDROID_D8_JAR="$PWD/.toolchain/r8.jar" bash build-apk.sh --release
           apk="dist/yuan-yang-${TAG#v}-release.apk"
           test -s "$apk"
           grep -F "versionName='${TAG#v}'" dist/apk-manifest-report-release.txt >/dev/null
