@@ -64,8 +64,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     private SurfaceView surface;
     private AspectFrame finder;
     private FinderOverlay overlay;
-    private Button shutter, switchCamera, overlaySettings, recoveryAction;
-    private Button overlayToggle;
+    private Button shutter, switchCamera, recoveryAction;
     private LinearLayout overlayControls;
     private SeekBar overlaySlider;
     private TextView hint, overlayAmount;
@@ -81,7 +80,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     private int preferredFacing = Camera.CameraInfo.CAMERA_FACING_BACK;
     private boolean frontFacing;
     private long lastSwitchAt = -400;
-    private boolean overlayVisible = true, overlayPanelExpanded, invalidReference;
+    private boolean invalidReference;
     private String queuedNavigation;
     private boolean resumed, previewing, shooting, saving, saveFinished, saveSucceeded, permissionPending;
     private String saveErrorSummary;
@@ -98,13 +97,13 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         captureUi = getSharedPreferences("captureUi", MODE_PRIVATE);
         preferredFacing = captureUi.getInt(CAMERA_FACING_KEY, Camera.CameraInfo.CAMERA_FACING_BACK);
         overlayStrength = captureUi.getInt("overlayStrength", 45);
-        overlayVisible = captureUi.getBoolean("overlayVisible", true);
+        // Migrate the former separate visibility toggle to the slider's zero.
+        if (!captureUi.getBoolean("overlayVisible", true)) overlayStrength = 0;
         if (state != null) {
             overlayStrength = state.getInt("overlayStrength", overlayStrength);
-            overlayVisible = state.getBoolean("overlayVisible", overlayVisible);
-            overlayPanelExpanded = state.getBoolean("overlayPanelExpanded", false);
+            if (!state.getBoolean("overlayVisible", true)) overlayStrength = 0;
         }
-        overlayStrength = Math.min(100, Math.max(1, overlayStrength));
+        overlayStrength = Math.min(100, Math.max(0, overlayStrength));
         String label = getIntent().getStringExtra(EXTRA_PROJECT);
         String path = state != null ? state.getString("nextPath", getIntent().getStringExtra(EXTRA_PATH))
                 : getIntent().getStringExtra(EXTRA_PATH);
@@ -138,8 +137,6 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
         state.putInt("overlayStrength", overlayStrength);
-        state.putBoolean("overlayVisible", overlayVisible);
-        state.putBoolean("overlayPanelExpanded", overlayPanelExpanded);
         if (target != null) state.putString("nextPath", target.getPath());
         if (referenceFile != null) state.putString("referencePath", referenceFile.getPath());
         if (pendingPhoto != null) state.putString("pendingPath", pendingPhoto.getPath());
@@ -172,16 +169,6 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         albumListButton.setMaxWidth(dp(134));
         albumListButton.setOnClickListener(v -> leave(RESULT_OPEN_ALBUM_LIST));
         header.addView(albumListButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
-        View spacer = new View(this);
-        header.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
-        overlaySettings = action("叠影设置");
-        overlaySettings.setSingleLine(true);
-        overlaySettings.setOnClickListener(v -> {
-            overlayPanelExpanded = !overlayPanelExpanded;
-            refreshOverlayControls();
-        });
-        header.addView(overlaySettings, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         root.addView(header);
 
         FrameLayout stage = new FrameLayout(this);
@@ -227,35 +214,37 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         recoveryAction.setVisibility(View.GONE);
 
         overlayControls = new LinearLayout(this);
-        overlayControls.setGravity(Gravity.CENTER_VERTICAL);
-        overlayToggle = action("隐藏叠影");
-        overlayToggle.setOnClickListener(v -> {
-            overlayVisible = !overlayVisible;
-            refreshOverlayControls();
-            rememberOverlay();
-            if (previewing) hint.setText(cameraHint());
-        });
-        overlayToggle.setMinWidth(dp(94));
-        overlayControls.addView(overlayToggle, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
+        overlayControls.setOrientation(LinearLayout.VERTICAL);
+        TextView overlayHelp = text("叠影？滑块拖到最左就是隐藏", 13, MUTED);
+        overlayHelp.setGravity(Gravity.CENTER);
+        overlayControls.addView(overlayHelp, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout sliderRow = new LinearLayout(this);
+        sliderRow.setGravity(Gravity.CENTER_VERTICAL);
+        sliderRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         overlaySlider = new SeekBar(this);
         overlaySlider.setContentDescription("旧照片叠影透明度");
-        overlaySlider.setMax(99);
-        overlaySlider.setProgress(overlayStrength - 1);
+        overlaySlider.setMax(100);
+        overlaySlider.setProgress(overlayStrength);
         overlaySlider.setProgressTintList(ColorStateList.valueOf(ACCENT));
         overlaySlider.setThumbTintList(ColorStateList.valueOf(ACCENT));
-        overlayControls.addView(overlaySlider, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        sliderRow.addView(overlaySlider, new LinearLayout.LayoutParams(0, dp(48), 1f));
         overlayAmount = text("", 13, WHITE);
         overlayAmount.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         overlayAmount.setMinWidth(dp(42));
-        overlayControls.addView(overlayAmount, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
+        sliderRow.addView(overlayAmount, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
+        overlayControls.addView(sliderRow);
         overlaySlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-                @Override public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
-                    overlayStrength = value + 1;
-                    refreshOverlayControls();
-                    if (fromUser) rememberOverlay();
-                }
-                @Override public void onStartTrackingTouch(SeekBar s) {}
-                @Override public void onStopTrackingTouch(SeekBar s) {}
+            @Override public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
+                boolean visibilityChanged = (overlayStrength == 0) != (value == 0);
+                overlayStrength = value;
+                refreshOverlayControls();
+                if (fromUser) rememberOverlay();
+                if (visibilityChanged && previewing && !shooting && !saving) hint.setText(cameraHint());
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) {}
+            @Override public void onStopTrackingTouch(SeekBar s) {}
         });
         root.addView(overlayControls);
 
@@ -287,18 +276,11 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     }
 
     private void refreshOverlayControls() {
-        boolean hasReference = oldPhoto != null;
-        overlayControls.setVisibility(hasReference && overlayPanelExpanded ? View.VISIBLE : View.GONE);
-        overlaySettings.setVisibility(hasReference ? View.VISIBLE : View.INVISIBLE);
-        overlaySettings.setSelected(overlayPanelExpanded);
-        overlaySettings.setText(overlayPanelExpanded ? "收起叠影设置" : "叠影设置");
+        overlayControls.setVisibility(oldPhoto != null ? View.VISIBLE : View.GONE);
         currentAlbumButton.invalidate();
-        overlayToggle.setText(overlayVisible ? "隐藏叠影" : "显示叠影");
-        overlayToggle.setSelected(overlayVisible);
-        overlaySlider.setEnabled(overlayVisible);
         overlayAmount.setText(overlayStrength + "%");
-        overlayAmount.setTextColor(overlayVisible ? WHITE : MUTED);
-        overlay.opacity = overlayVisible ? overlayStrength / 100f : 0f;
+        overlayAmount.setTextColor(overlayStrength > 0 ? WHITE : MUTED);
+        overlay.opacity = overlayStrength / 100f;
         overlay.invalidate();
     }
 
@@ -308,7 +290,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     }
 
     private void rememberOverlay() {
-        captureUi.edit().putBoolean("overlayVisible", overlayVisible)
+        captureUi.edit().remove("overlayVisible")
                 .putInt("overlayStrength", overlayStrength).apply();
     }
 
@@ -711,7 +693,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
 
     private String cameraHint() {
         String status;
-        if (oldPhoto != null) status = overlayVisible ? "移动手机，手动对齐旧照。" : "叠影已隐藏，拍照仍会保存到相册。";
+        if (oldPhoto != null) status = overlayStrength > 0 ? "移动手机，手动对齐旧照。" : "叠影已隐藏，拍照仍会保存到相册。";
         else if (invalidReference) status = "上一张照片无法读取，可继续拍摄。";
         else status = "照片保存在当前相册中。";
         return frontFacing ? "前置预览为镜像，保存不镜像。\n" + status : status;

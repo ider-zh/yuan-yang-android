@@ -22,7 +22,8 @@ ROOT=Path(__file__).resolve().parents[1]
 SHUTTER=('拍照','复拍')
 FRONT=('切换到前置摄像头','切换到前置')
 REAR=('切换到后置摄像头','切换到后置')
-OVERLAY=('叠影设置','收起叠影设置')
+OVERLAY=('叠影设置','收起叠影设置','隐藏叠影','显示叠影')
+OVERLAY_HELP='叠影？滑块拖到最左就是隐藏'
 SLIDER='旧照片叠影透明度'
 EXPORT='制作影像'
 GALLERY='继续拍摄'
@@ -111,23 +112,25 @@ def camera_review(ui,args,tree,shutter):
         assert abs(before[1]-after[1])<=3,('flip shifted shutter vertically',before,after)
         passed('flipping cameras preserves shutter position and 48dp hit targets')
         tree=updated
+    assert match(tree,OVERLAY) is None, 'Separate overlay buttons should not appear'
     if args.photos:
-        ghost=active_action(tree,OVERLAY)
-        assert center(ghost)[1]<album_center[1],'Overlay settings must be separate from the shutter row'
-        assert match(tree,SLIDER) is None,'Overlay slider should start collapsed'
-        tap_node(ui,ghost)
-        opened,_=window(ui,SLIDER)
-        button=match(opened,('隐藏叠影','显示叠影'))
-        assert button is not None,'Overlay drawer lacks independent visibility action'
-        _,shutter_open=expect_center(ui,opened,active_action(opened,SHUTTER),'native-camera-overlay-expanded')
-        assert_x_stable(before,shutter_open,'overlay panel')
-        tap_node(ui,active_action(opened,'收起叠影设置'))
-        closed,_=window(ui,'叠影设置')
-        assert match(closed,SLIDER) is None,'Collapsing should hide opacity slider'
-        _,shutter_closed=expect_center(ui,closed,active_action(closed,SHUTTER),'native-camera-overlay-collapsed')
-        assert_x_stable(before,shutter_closed,'collapsed panel')
-        passed('overlay settings expand/collapse independently without moving the shutter off center')
-        tree=closed
+        assert match(tree,OVERLAY_HELP) is not None, 'Missing overlay guidance'
+        slider=active_action(tree,SLIDER)
+        x1,y1,x2,y2=bounds(slider)
+        y=(y1+y2)//2
+        assert y < album_center[1], 'Overlay slider must not displace the shutter row'
+        ui.shell('input','swipe',str((x1+x2)//2),str(y),str(x1+1),str(y),'300')
+        hidden,_=window(ui,'0%')
+        assert match(hidden,'叠影已隐藏',contains=True), 'Zero did not hide the overlay'
+        _,shutter_hidden=expect_center(ui,hidden,active_action(hidden,SHUTTER),'native-camera-overlay-hidden')
+        assert_x_stable(before,shutter_hidden,'hidden overlay')
+        assert abs(before[1]-shutter_hidden[1])<=3, ('sliding moved shutter vertically',before,shutter_hidden)
+        ui.shell('input','swipe',str(x1+1),str(y),str(x2-2),str(y),'300')
+        tree,_=window(ui,'100%')
+        assert match(tree,'移动手机，手动对齐旧照。',contains=True), 'Sliding right did not restore the overlay'
+        passed('one slider hides at the left endpoint and restores on the right; shutter stays put')
+    else:
+        assert match(tree,SLIDER) is None and match(tree,OVERLAY_HELP) is None, 'Overlay controls without a photo'
     return tree
 
 def parse_count(tree):
