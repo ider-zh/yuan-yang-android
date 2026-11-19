@@ -7,27 +7,38 @@ LEGACY=${ANDROID_BUILD_TOOLS_DIR:-$APP/../android-build-tools}
 MAIN="$APP/app/src/main"
 BUILD="$APP/build"
 DIST="$APP/dist"
-VERSION=0.7.1
+VERSION=$(sed -nE 's/.*android:versionName="([^"]+)".*/\1/p' "$MAIN/AndroidManifest.xml")
 MEDIAPIPE=${YUANYANG_MEDIAPIPE_DIR:-$APP/.toolchain/mediapipe}
 QA_DEBUGGABLE=${YUANYANG_QA_DEBUGGABLE:-0}
 ABIS=${YUANYANG_ABIS:-universal}
 ORIGINAL_CERT=94c0f46dafdd9d4f903aa360b0b9c61161f0326b97ee21dc2dd7b6a150b8439e
 PARALLEL_CERT=aaaf9b17181234e4e7e749405870c40c1338aede19e0b1f95691bcd421dddd2b
 PARALLEL_PREVIEW=0
-if [[ $# == 1 && ( $1 == --preview || $1 == --parallel-preview ) ]]; then
+RELEASE_CERT=3e7d7a81b81ce5691cabd098e99ffc748e3c78452da494abe7a75c89c8115a9c
+RELEASE=0
+if [[ $# == 1 && $1 == --release ]]; then
+    RELEASE=1
+    PREVIEW=0
+    : "${YUANYANG_KEYSTORE:?Release keystore path is required}"
+    : "${YUANYANG_KEY_ALIAS:?Release key alias is required}"
+    : "${YUANYANG_STORE_PASSWORD:?Release store password is required}"
+    : "${YUANYANG_KEY_PASSWORD:?Release key password is required}"
+    [[ -s "$YUANYANG_KEYSTORE" ]] ||
+        { echo "Missing release keystore." >&2; exit 1; }
+elif [[ $# == 1 && ( $1 == --preview || $1 == --parallel-preview ) ]]; then
     PREVIEW=1
     if [[ $1 == --parallel-preview ]]; then PARALLEL_PREVIEW=1; fi
 elif [[ $# == 0 ]]; then
     PREVIEW=0
 else
-    echo "Usage: ./build-apk.sh [--preview|--parallel-preview]" >&2; exit 2
+    echo "Usage: ./build-apk.sh [--preview|--parallel-preview|--release]" >&2; exit 2
 fi
 if [[ "$QA_DEBUGGABLE" != 0 && "$QA_DEBUGGABLE" != 1 ]] || (( QA_DEBUGGABLE && ! PREVIEW )); then
     echo "YUANYANG_QA_DEBUGGABLE=1 is allowed only with --preview." >&2; exit 2
 fi
 if [[ "$ABIS" != universal && "$ABIS" != arm64-v8a,armeabi-v7a ]] ||
-   { [[ "$ABIS" != universal ]] && (( ! PREVIEW || QA_DEBUGGABLE )); }; then
-    echo 'YUANYANG_ABIS=arm64-v8a,armeabi-v7a requires non-QA --preview.' >&2; exit 2
+   { [[ "$ABIS" != universal ]] && (( (! PREVIEW && ! RELEASE) || QA_DEBUGGABLE )); }; then
+    echo 'YUANYANG_ABIS=arm64-v8a,armeabi-v7a requires a non-QA preview or release.' >&2; exit 2
 fi
 if [[ -n "$SDK" && -f "$SDK/platforms/android-34/android.jar" && -x "$SDK/build-tools/34.0.0/aapt2" ]]; then
     TOOLS="$SDK/build-tools/34.0.0"
@@ -158,7 +169,9 @@ MIN_API=$(sed -nE 's/.*android:minSdkVersion="([0-9]+)".*/\1/p' "$MAIN/AndroidMa
 
 KEY="${YUANYANG_KEYSTORE:-$BUILD/debug.keystore}"
 SUFFIX=debug
-if (( PREVIEW )); then
+if (( RELEASE )); then
+    SUFFIX=release
+elif (( PREVIEW )); then
     KEY="$BUILD/preview.keystore"
     SUFFIX=preview
     if (( QA_DEBUGGABLE )); then SUFFIX=qa; fi
@@ -181,22 +194,41 @@ if [[ ! -e "$KEY" ]]; then
     umask 022
 fi
 APK="$DIST/yuan-yang-$VERSION-$SUFFIX.apk"
-"${SIGNER[@]}" sign --v4-signing-enabled false --ks "$KEY" --ks-key-alias androiddebugkey \
-  --ks-pass pass:android --key-pass pass:android --out "$TMP/signed.apk" "$TMP/aligned.apk"
+if (( RELEASE )); then
+    "${SIGNER[@]}" sign --v4-signing-enabled false --ks "$KEY" --ks-key-alias "$YUANYANG_KEY_ALIAS" \
+      --ks-pass env:YUANYANG_STORE_PASSWORD --key-pass env:YUANYANG_KEY_PASSWORD --out "$TMP/signed.apk" "$TMP/aligned.apk"
+else
+    "${SIGNER[@]}" sign --v4-signing-enabled false --ks "$KEY" --ks-key-alias androiddebugkey \
+      --ks-pass pass:android --key-pass pass:android --out "$TMP/signed.apk" "$TMP/aligned.apk"
+fi
 "${SIGNER[@]}" verify --verbose --print-certs "$TMP/signed.apk" > "$TMP/apk-signature-report.txt"
-if (( ! PREVIEW )) && ! grep -q "certificate SHA-256 digest: $ORIGINAL_CERT" "$TMP/apk-signature-report.txt"; then
+if (( ! PREVIEW && ! RELEASE )) && ! grep -q "certificate SHA-256 digest: $ORIGINAL_CERT" "$TMP/apk-signature-report.txt"; then
     echo "Refusing an incompatible in-place upgrade: signer does not match the original APK." >&2; exit 1
 fi
 if (( PARALLEL_PREVIEW )) && ! grep -Fqx "Signer #1 certificate SHA-256 digest: $PARALLEL_CERT" "$TMP/apk-signature-report.txt"; then
     echo "Refusing an incompatible parallel upgrade: signer does not match 0.7.0." >&2; exit 1
 fi
+if (( RELEASE )) && ! grep -Fqx "Signer #1 certificate SHA-256 digest: $RELEASE_CERT" "$TMP/apk-signature-report.txt"; then
+    echo "Refusing release: signing certificate does not match the configured fingerprint." >&2; exit 1
+fi
 REPORT_SUFFIX=
 if (( QA_DEBUGGABLE )); then REPORT_SUFFIX=-qa; fi
 if [[ "$ABIS" != universal ]]; then REPORT_SUFFIX=-phone; fi
+if (( RELEASE )); then REPORT_SUFFIX=-release; fi
 if (( PARALLEL_PREVIEW )); then REPORT_SUFFIX="-parallel$REPORT_SUFFIX"; fi
 cp "$TMP/apk-signature-report.txt" "$DIST/apk-signature-report$REPORT_SUFFIX.txt"
 "$ZIPALIGN" -c -v 4 "$TMP/signed.apk" > "$DIST/apk-alignment-report$REPORT_SUFFIX.txt"
 "$AAPT" dump badging "$TMP/signed.apk" > "$DIST/apk-manifest-report$REPORT_SUFFIX.txt"
+if (( RELEASE )); then
+    badging="$DIST/apk-manifest-report$REPORT_SUFFIX.txt"
+    version_code=$(sed -nE 's/.*android:versionCode="([0-9]+)".*/\1/p' "$MAIN/AndroidManifest.xml")
+    [[ "$version_code" =~ ^[1-9][0-9]*$ ]] && (( version_code >= 10 )) &&
+        grep -Fqx "application-label:'原样'" "$badging" &&
+        grep -Fq "package: name='com.yuanyang.camera' versionCode='$version_code' versionName='$VERSION' " "$badging" &&
+        grep -Eq "^[[:space:]]*versionCode $version_code[[:space:]]*$" "$APP/app/build.gradle" &&
+        grep -Fxq "        versionName '$VERSION'" "$APP/app/build.gradle" ||
+        { echo "Refusing release: App identity, version, or label does not match." >&2; exit 1; }
+fi
 if grep -q 'android.permission.INTERNET' "$DIST/apk-manifest-report$REPORT_SUFFIX.txt"; then
     echo "Refusing an APK with network permission." >&2; exit 1
 fi
