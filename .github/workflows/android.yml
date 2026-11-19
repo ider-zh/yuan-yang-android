@@ -21,11 +21,14 @@ jobs:
         run: |
           export JAVA_HOME="$JAVA_HOME_17_X64"
           export PATH="$JAVA_HOME/bin:$PATH"
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?Android SDK is not installed}}"
+          test -s "$ANDROID_SDK_ROOT/platforms/android-34/android.jar"
+          test -x "$ANDROID_SDK_ROOT/build-tools/34.0.0/aapt2"
           mkdir -p .toolchain
           curl --fail --silent --show-error --location --retry 3 \
             https://dl.google.com/dl/android/maven2/com/android/tools/r8/9.5.28/r8-9.5.28.jar -o .toolchain/r8.jar
           echo '38a9ffaaebbd17d1514e3ecbff5a85b989bb13c551b9e224c7409514eea84ff5  .toolchain/r8.jar' | sha256sum --check
+          bash tests/check-camera-options.sh
           bash tests/check-timeline.sh
           bash tests/check-timelapse-media.sh
           bash tests/check-pose-alignment.sh
@@ -57,7 +60,9 @@ jobs:
           git merge-base --is-ancestor HEAD refs/remotes/origin/main
           export JAVA_HOME="$JAVA_HOME_17_X64"
           export PATH="$JAVA_HOME/bin:$PATH"
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?Android SDK is not installed}}"
+          test -s "$ANDROID_SDK_ROOT/platforms/android-34/android.jar"
+          test -x "$ANDROID_SDK_ROOT/build-tools/34.0.0/aapt2"
           mkdir -p .toolchain
           curl --fail --silent --show-error --location --retry 3 \
             https://dl.google.com/dl/android/maven2/com/android/tools/r8/9.5.28/r8-9.5.28.jar -o .toolchain/r8.jar

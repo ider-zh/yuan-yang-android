@@ -2,6 +2,7 @@ package com.yuanyang.camera;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -37,7 +38,11 @@ import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -48,6 +53,7 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     public static final String EXTRA_PATH = "path";
     public static final String EXTRA_REFERENCE = "reference";
     public static final String EXTRA_PROJECT = "project";
+    public static final String EXTRA_ALBUM_ID = "albumId";
     public static final String RESULT_OPEN_ALBUM_LIST = "open_album_list";
     public static final String RESULT_OPEN_PROJECT = "open_project";
     public static final String RESULT_EXIT_APP = "exit_app";
@@ -64,7 +70,17 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
     private SurfaceView surface;
     private AspectFrame finder;
     private FinderOverlay overlay;
-    private Button shutter, switchCamera, recoveryAction;
+    private Button shutter, switchCamera, recoveryAction, rearLenses, macroControl;
+    private LinearLayout zoomRow;
+    private SeekBar zoomSlider;
+    private TextView zoomAmount;
+    private String albumId;
+    private List<Integer> zoomRatios = Collections.emptyList();
+    private int zoomIndex;
+    private boolean macroSupported, macroEnabled, updatingZoom;
+    private final List<Integer> rearIds = new ArrayList<>();
+    private final Map<Integer, Float> rearAngles = new HashMap<>();
+    private final List<Integer> unavailableRearIds = new ArrayList<>();
     private LinearLayout overlayControls;
     private SeekBar overlaySlider;
     private TextView hint, overlayAmount;
@@ -95,7 +111,9 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         decor.setSystemUiVisibility(decor.getSystemUiVisibility()
                 & ~(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR));
         captureUi = getSharedPreferences("captureUi", MODE_PRIVATE);
-        preferredFacing = captureUi.getInt(CAMERA_FACING_KEY, Camera.CameraInfo.CAMERA_FACING_BACK);
+        albumId = getIntent().getStringExtra(EXTRA_ALBUM_ID);
+        preferredFacing = captureUi.getInt(cameraSetting("facing"),
+                captureUi.getInt(CAMERA_FACING_KEY, Camera.CameraInfo.CAMERA_FACING_BACK));
         overlayStrength = captureUi.getInt("overlayStrength", 45);
         // Migrate the former separate visibility toggle to the slider's zero.
         if (!captureUi.getBoolean("overlayVisible", true)) overlayStrength = 0;
@@ -169,6 +187,13 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         albumListButton.setMaxWidth(dp(134));
         albumListButton.setOnClickListener(v -> leave(RESULT_OPEN_ALBUM_LIST));
         header.addView(albumListButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
+        header.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1f));
+        rearLenses = action("镜头");
+        rearLenses.setOnClickListener(v -> chooseRearLens());
+        header.addView(rearLenses, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
+        macroControl = action("近摄");
+        macroControl.setOnClickListener(v -> toggleMacro());
+        header.addView(macroControl, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
         root.addView(header);
 
         FrameLayout stage = new FrameLayout(this);
@@ -247,6 +272,27 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             @Override public void onStopTrackingTouch(SeekBar s) {}
         });
         root.addView(overlayControls);
+        zoomRow = new LinearLayout(this);
+        zoomRow.setGravity(Gravity.CENTER_VERTICAL);
+        zoomRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        zoomRow.addView(text("变焦", 13, MUTED));
+        zoomSlider = new SeekBar(this);
+        zoomSlider.setContentDescription("相机变焦");
+        zoomSlider.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        zoomSlider.setThumbTintList(ColorStateList.valueOf(ACCENT));
+        zoomRow.addView(zoomSlider, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        zoomAmount = text("", 13, WHITE);
+        zoomAmount.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        zoomAmount.setMinWidth(dp(50));
+        zoomRow.addView(zoomAmount, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48)));
+        zoomSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int value, boolean fromUser) {
+                if (fromUser && !updatingZoom) changeZoom(value);
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) {}
+            @Override public void onStopTrackingTouch(SeekBar s) {}
+        });
+        root.addView(zoomRow);
 
         shutter = new GlyphButton(GlyphButton.SHUTTER);
         shutter.setContentDescription(shutterLabel());
@@ -359,15 +405,19 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         if (!resumed || isFinishing() || camera != null || shooting || target == null || !hasCameraPermission()
                 || !surface.getHolder().getSurface().isValid()) return;
         findCameras();
-        int preferred = preferredFacing == Camera.CameraInfo.CAMERA_FACING_FRONT ? frontCameraId : backCameraId;
-        int alternate = preferredFacing == Camera.CameraInfo.CAMERA_FACING_FRONT ? backCameraId : frontCameraId;
-        if (openCamera(preferred) || openCamera(alternate)
-                || (fallbackCameraId != preferred && fallbackCameraId != alternate && openCamera(fallbackCameraId))) return;
+        int rear = rememberedRear();
+        int preferred = preferredFacing == Camera.CameraInfo.CAMERA_FACING_FRONT ? frontCameraId : rear;
+        if (openCamera(preferred)) return;
+        if (backCameraId != preferred && openCamera(backCameraId)) return;
+        if (frontCameraId != preferred && openCamera(frontCameraId)) return;
+        if (fallbackCameraId != preferred && fallbackCameraId != backCameraId
+                && fallbackCameraId != frontCameraId && openCamera(fallbackCameraId)) return;
         showRetry("无法打开相机，检查是否被其他应用占用。");
     }
 
     private void findCameras() {
         backCameraId = frontCameraId = fallbackCameraId = NO_CAMERA;
+        rearIds.clear();
         int count;
         try { count = Camera.getNumberOfCameras(); }
         catch (RuntimeException e) { return; }
@@ -376,7 +426,10 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             try { Camera.getCameraInfo(i, info); }
             catch (RuntimeException e) { continue; }
             if (fallbackCameraId == NO_CAMERA) fallbackCameraId = i;
-            if (info.facing == Camera.CameraInfo.CAMERA_FACING_BACK && backCameraId == NO_CAMERA) backCameraId = i;
+            if (info.facing == Camera.CameraInfo.CAMERA_FACING_BACK) {
+                rearIds.add(i);
+                if (backCameraId == NO_CAMERA) backCameraId = i;
+            }
             if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT && frontCameraId == NO_CAMERA) frontCameraId = i;
         }
     }
@@ -400,13 +453,32 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             // JPEG unmirrored and mirror only the reference drawn over preview.
             int previewRotation = front ? (360 - jpegRotation) % 360 : jpegRotation;
             p.setRotation(jpegRotation);
-            List<String> focus = p.getSupportedFocusModes();
-            if (focus != null && focus.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                p.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
-            } else if (focus != null && focus.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
-                p.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+            if (!front) {
+                rearAngles.put(cameraId, viewAngle(p));
+                unavailableRearIds.remove(Integer.valueOf(cameraId));
             }
-            camera.setParameters(p);
+            macroSupported = !front && supportsMacro(p);
+            macroEnabled = macroSupported && captureUi.getBoolean(cameraSetting("macro/" + cameraId), false);
+            applyFocus(p, macroEnabled);
+            zoomRatios = readZoomRatios(p);
+            zoomIndex = 0;
+            if (!zoomRatios.isEmpty()) {
+                int ratio = captureUi.getInt(cameraSetting("zoom/" + cameraId), 100);
+                zoomIndex = CameraOptions.zoomIndex(zoomRatios, ratio);
+                p.setZoom(zoomIndex);
+            }
+            try {
+                camera.setParameters(p);
+            } catch (RuntimeException rejected) {
+                // Some vendors advertise unsupported combinations. Keep a usable preview
+                // even if the stored optional parameters cannot be restored.
+                if (zoomIndex == 0 && !macroEnabled) throw rejected;
+                macroEnabled = false;
+                zoomIndex = 0;
+                if (!zoomRatios.isEmpty()) p.setZoom(0);
+                applyFocus(p, false);
+                camera.setParameters(p);
+            }
             camera.setDisplayOrientation(previewRotation);
             finder.ratio = previewRotation % 180 == 0 ? (float) preview.width / preview.height : (float) preview.height / preview.width;
             finder.requestLayout();
@@ -422,10 +494,6 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             activeCameraId = cameraId;
             frontFacing = front;
             startPreview();
-            if (preferredFacing != info.facing || !captureUi.contains(CAMERA_FACING_KEY)) {
-                preferredFacing = info.facing;
-                captureUi.edit().putInt(CAMERA_FACING_KEY, preferredFacing).apply();
-            }
             overlay.invalidate();
             return true;
         } catch (IOException | RuntimeException e) {
@@ -438,16 +506,159 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         long now = SystemClock.elapsedRealtime();
         if (!resumed || isFinishing() || !previewing || shooting || saving || queuedNavigation != null
                 || now - lastSwitchAt < 350 || backCameraId == NO_CAMERA || frontCameraId == NO_CAMERA) return;
+        switchLens(frontFacing ? rememberedRear() : frontCameraId);
+    }
+
+    private String cameraSetting(String option) { return CameraOptions.albumKey(albumId, option); }
+
+    private int rememberedRear() {
+        int id = captureUi.getInt(cameraSetting("rear"), backCameraId);
+        return rearIds.contains(id) ? id : backCameraId;
+    }
+
+    private boolean canChangeCamera() {
+        return resumed && !isFinishing() && previewing && !shooting && !saving && queuedNavigation == null;
+    }
+
+    private void switchLens(int requested) {
+        if (!canChangeCamera() || requested == NO_CAMERA || requested == activeCameraId) return;
         int before = activeCameraId;
-        int requested = frontFacing ? backCameraId : frontCameraId;
-        if (requested == before) return;
         shutter.setEnabled(false);
         closeCamera();
-        if (!openCamera(requested)) {
-            if (openCamera(before)) hint.setText("切换失败，已恢复原摄像头。");
-            else showRetry("切换失败，请重试相机。");
+        if (openCamera(requested)) {
+            preferredFacing = frontFacing ? Camera.CameraInfo.CAMERA_FACING_FRONT : Camera.CameraInfo.CAMERA_FACING_BACK;
+            SharedPreferences.Editor editor = captureUi.edit().putInt(cameraSetting("facing"), preferredFacing);
+            if (!frontFacing) {
+                editor.putInt(cameraSetting("rear"), requested);
+                editor.putString(cameraSetting("rearLabel"), rearLabel(requested));
+            }
+            editor.apply();
+        } else if (openCamera(before)) {
+            hint.setText("切换失败，已恢复原摄像头。");
+        } else {
+            startCameraIfReady();
+            if (!previewing) showRetry("切换失败，请重试相机。");
         }
         lastSwitchAt = SystemClock.elapsedRealtime();
+    }
+
+    private void chooseRearLens() {
+        if (!canChangeCamera() || frontFacing || rearIds.size() < 2) return;
+        int before = activeCameraId;
+        // Opening other Camera1 devices can require exclusive access. Probe only
+        // on demand and always restore the previous preview before showing choices.
+        if (!rearAngles.keySet().containsAll(rearIds)) {
+            closeCamera();
+            for (int id : rearIds) {
+                if (rearAngles.containsKey(id) || unavailableRearIds.contains(id)) continue;
+                Camera probe = null;
+                try {
+                    probe = Camera.open(id);
+                    rearAngles.put(id, viewAngle(probe.getParameters()));
+                } catch (RuntimeException unavailable) {
+                    unavailableRearIds.add(id);
+                } finally {
+                    if (probe != null) try { probe.release(); } catch (RuntimeException ignored) {}
+                }
+            }
+            if (!openCamera(before)) {
+                startCameraIfReady();
+                return;
+            }
+        }
+        List<Integer> choices = new ArrayList<>(rearIds);
+        choices.removeAll(unavailableRearIds);
+        if (choices.size() < 2) {
+            updateSwitchControl();
+            hint.setText("其它后置镜头当前不可用。");
+            return;
+        }
+        String[] labels = new String[choices.size()];
+        for (int i = 0; i < labels.length; i++) {
+            int id = choices.get(i);
+            labels[i] = rearLabel(id);
+        }
+        new AlertDialog.Builder(this).setTitle("后置镜头")
+                .setSingleChoiceItems(labels, choices.indexOf(activeCameraId), (dialog, index) -> {
+                    dialog.dismiss();
+                    switchLens(choices.get(index));
+                }).setNegativeButton("取消", null).show();
+    }
+
+    private String rearLabel(int id) {
+        return CameraOptions.rearLabel(rearIds.indexOf(id), rearAngles.getOrDefault(backCameraId, -1f),
+                rearAngles.getOrDefault(id, -1f));
+    }
+
+    private static boolean supportsMacro(Camera.Parameters p) {
+        List<String> modes = p.getSupportedFocusModes();
+        if (modes == null || !modes.contains(Camera.Parameters.FOCUS_MODE_MACRO)) return false;
+        for (String mode : modes) if (!Camera.Parameters.FOCUS_MODE_MACRO.equals(mode)) return true;
+        return false;
+    }
+
+    private static float viewAngle(Camera.Parameters p) {
+        try { return p.getHorizontalViewAngle(); }
+        catch (RuntimeException invalid) { return -1f; }
+    }
+
+    private static void applyFocus(Camera.Parameters p, boolean macro) {
+        List<String> modes = p.getSupportedFocusModes();
+        if (modes == null) return;
+        if (macro && modes.contains(Camera.Parameters.FOCUS_MODE_MACRO)) {
+            p.setFocusMode(Camera.Parameters.FOCUS_MODE_MACRO);
+        } else if (modes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+            p.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+        } else if (modes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+            p.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+        } else {
+            for (String mode : modes) if (!Camera.Parameters.FOCUS_MODE_MACRO.equals(mode)) {
+                p.setFocusMode(mode);
+                return;
+            }
+        }
+    }
+
+    private static List<Integer> readZoomRatios(Camera.Parameters p) {
+        try {
+            return p.isZoomSupported() ? CameraOptions.validatedZoomRatios(p.getZoomRatios(), p.getMaxZoom())
+                    : Collections.emptyList();
+        } catch (RuntimeException invalid) {
+            return Collections.emptyList();
+        }
+    }
+
+    private void changeZoom(int index) {
+        if (!canChangeCamera() || index < 0 || index >= zoomRatios.size() || index == zoomIndex) return;
+        try {
+            Camera.Parameters p = camera.getParameters();
+            p.setZoom(index);
+            camera.setParameters(p);
+            int actual = camera.getParameters().getZoom();
+            if (actual >= 0 && actual < zoomRatios.size()) {
+                zoomIndex = actual;
+                captureUi.edit().putInt(cameraSetting("zoom/" + activeCameraId), zoomRatios.get(actual)).apply();
+            }
+        } catch (RuntimeException rejected) {
+            hint.setText("这个变焦档位不可用。");
+        }
+        updateSwitchControl();
+    }
+
+    private void toggleMacro() {
+        if (!canChangeCamera() || !macroSupported) return;
+        try {
+            boolean desired = !macroEnabled;
+            Camera.Parameters p = camera.getParameters();
+            applyFocus(p, desired);
+            if (desired != Camera.Parameters.FOCUS_MODE_MACRO.equals(p.getFocusMode())) return;
+            camera.setParameters(p);
+            macroEnabled = Camera.Parameters.FOCUS_MODE_MACRO.equals(camera.getParameters().getFocusMode());
+            captureUi.edit().putBoolean(cameraSetting("macro/" + activeCameraId), macroEnabled).apply();
+        } catch (RuntimeException rejected) {
+            hint.setText("当前镜头无法切换近摄。");
+        }
+        updateSwitchControl();
     }
 
     private void updateSwitchControl() {
@@ -457,6 +668,35 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
         switchCamera.setEnabled(both && previewing && !shooting && !saving && resumed);
         String action = frontFacing ? "切换到后置" : "切换到前置";
         labelGlyph(switchCamera, action + "摄像头");
+        boolean ready = canChangeCamera();
+        int selectableRear = 0;
+        for (int id : rearIds) if (!unavailableRearIds.contains(id)) selectableRear++;
+        boolean hasLensOptions = previewing && !frontFacing && selectableRear > 1;
+        rearLenses.setVisibility(hasLensOptions ? View.VISIBLE : View.GONE);
+        rearLenses.setEnabled(ready);
+        if (hasLensOptions) {
+            String label = rearLabel(activeCameraId);
+            if (!rearAngles.containsKey(backCameraId) && rememberedRear() == activeCameraId) {
+                label = captureUi.getString(cameraSetting("rearLabel"), label);
+            }
+            rearLenses.setText(label.startsWith("广角") ? "广角" : label.startsWith("窄视角") ? "窄视角" : "镜头");
+            rearLenses.setContentDescription("选择后置镜头，当前：" + label);
+        }
+        macroControl.setVisibility(previewing && macroSupported ? View.VISIBLE : View.GONE);
+        macroControl.setEnabled(ready);
+        macroControl.setSelected(macroEnabled);
+        macroControl.setText(macroEnabled ? "近摄：开" : "近摄");
+        // Hold existing geometry while capture and saving temporarily suspend preview.
+        boolean hasZoom = activeCameraId != NO_CAMERA && !zoomRatios.isEmpty();
+        zoomRow.setVisibility(hasZoom ? View.VISIBLE : View.GONE);
+        zoomSlider.setEnabled(ready && hasZoom);
+        if (hasZoom) {
+            updatingZoom = true;
+            zoomSlider.setMax(zoomRatios.size() - 1);
+            zoomSlider.setProgress(zoomIndex);
+            zoomAmount.setText(java.text.NumberFormat.getNumberInstance().format(zoomRatios.get(zoomIndex) / 100d) + "×");
+            updatingZoom = false;
+        }
     }
 
     private void startPreview() {
@@ -522,7 +762,8 @@ public final class CaptureActivity extends Activity implements SurfaceHolder.Cal
             triggerShutter(current, shot);
             return;
         }
-        if (Camera.Parameters.FOCUS_MODE_AUTO.equals(focusMode)) {
+        if (Camera.Parameters.FOCUS_MODE_AUTO.equals(focusMode)
+                || Camera.Parameters.FOCUS_MODE_MACRO.equals(focusMode)) {
             try {
                 current.autoFocus((success, instance) -> triggerShutter(instance, shot));
                 shutter.postDelayed(() -> triggerShutter(current, shot), 850);

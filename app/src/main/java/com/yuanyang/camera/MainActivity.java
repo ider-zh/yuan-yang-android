@@ -384,7 +384,8 @@ public final class MainActivity extends Activity {
             List<File> files=projectPhotos(project);
             File target=timeline.newPhoto(spaceId);
             Intent it=new Intent(this,CaptureActivity.class).putExtra(CaptureActivity.EXTRA_PATH,target.getAbsolutePath())
-                .putExtra(CaptureActivity.EXTRA_PROJECT,albumName(project));
+                .putExtra(CaptureActivity.EXTRA_PROJECT,albumName(project))
+                .putExtra(CaptureActivity.EXTRA_ALBUM_ID,spaceId);
             if(!files.isEmpty()) it.putExtra(CaptureActivity.EXTRA_REFERENCE,files.get(files.size()-1).getAbsolutePath());
             cameraInFlight=TIMELINE_CAPTURE;
             startActivityForResult(it,TIMELINE_CAPTURE);return true;
