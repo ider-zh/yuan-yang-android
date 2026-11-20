@@ -91,11 +91,9 @@ jobs:
           test -s "$apk"
           grep -F "versionName='${TAG#v}'" dist/apk-manifest-report-release.txt >/dev/null
           (cd dist && sha256sum --check SHA256SUMS-release)
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          draft=()
-          if [[ "$TAG" == v0.7.2 ]]; then draft+=(--draft); fi
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "原样 ${TAG#v}" --generate-notes "${draft[@]}" -- "dist/yuan-yang-${TAG#v}-release.apk" dist/SHA256SUMS-release
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "原样 ${TAG#v}" --generate-notes -- "dist/yuan-yang-${TAG#v}-release.apk" dist/SHA256SUMS-release

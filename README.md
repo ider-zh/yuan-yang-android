@@ -25,7 +25,7 @@ Android 7.0+ 原生相机。连续记录同一个拍摄主题，把照片做成 
 正式版 0.7.2 使用应用标识 `com.yuanyang.camera` 和新的正式签名。它与 0.7.x 并行测试版、0.3–0.6 测试版可共存，但不会自动迁移照片；同包名的 0.2.1 原版不能直接覆盖。**不要卸载有未备份照片的旧版。**
 发布只提供一个正式 APK（ARM64 和 ARMv7）。
 
-GitHub Actions 在普通提交和 PR 上测试，不读取正式签名密钥。将已审核且在 `main` 上的提交打 `vX.Y.Z` 标签，才会触发正式签名和 Release。标签须与 APK 版本一致；每个新版本须同时递增 Manifest 和 Gradle 的 `versionCode`。首个 `v0.7.2` 生成草稿，检查实际安装、显示名称和拍摄后再公开。后续标签自动发布。
+GitHub Actions 在普通提交和 PR 上测试，不读取正式签名密钥。将已审核且在 `main` 上的提交打 `vX.Y.Z` 标签，才会触发正式签名和 Release。标签须与 APK 版本一致；每个新版本须同时递增 Manifest 和 Gradle 的 `versionCode`。正式标签（包括首个 `v0.7.2`）通过测试、签名和校验后，Actions 自动公开发布 GitHub Release，并附上正式 APK 和 SHA-256 校验文件，无需手动发布草稿。
 维护者应先在 GitHub 仓库设置中创建 `release` 环境，将部署限定为正式标签，并限制谁可以创建或更改这些标签。该环境需要 `ANDROID_SIGNING_KEYSTORE_B64` 和 `ANDROID_SIGNING_PASSWORD`，不得将对应值提交到仓库或写入日志。密钥库应另存加密备份。
 
 ## 构建和回归
